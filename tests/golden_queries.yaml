@@ -1,0 +1,17 @@
+queries:
+  - query: "checkout retry"
+    scope: "company"
+    expected_top3_contains:
+      - "Checkout Retry Rule"
+  - query: "testing standard"
+    scope: "company"
+    expected_top3_contains:
+      - "Testing Standard"
+  - query: "receipt parser"
+    scope: "product:notebook"
+    expected_top3_contains:
+      - "Receipt Parser"
+  - query: "closeout release"
+    scope: "os"
+    expected_top3_contains:
+      - "Closeout"

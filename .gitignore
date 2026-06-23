@@ -1,0 +1,11 @@
+/target/
+/.venv/
+/.ruff_cache/
+/.pytest_cache/
+/.coverage
+Cargo.lock
+uv.lock
+*.db
+*.db-*
+*.profraw
+*.profdata

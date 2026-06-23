@@ -1,0 +1,31 @@
+- slug: os-foundation
+  title: OS Foundation
+  scope: os
+  locked_on: 2026-06-14
+  supersedes: null
+  body: |
+    OS rules outrank project preferences.
+- slug: company-old
+  title: Company Old
+  scope: company
+  locked_on: 2026-06-09
+  supersedes: null
+  body: |
+    Old company rule that should be superseded.
+- slug: company-current
+  title: Company Current
+  scope: company
+  locked_on: 2026-06-12
+  supersedes: company-old
+  body: |
+    Current company rule replaces the old one.
+
+    - Keep provenance visible.
+    - Keep projections generated.
+- slug: product-alpha
+  title: Product Alpha
+  scope: product:alpha
+  locked_on: 2026-06-10
+  supersedes: null
+  body: |
+    Product alpha keeps its local rule after company scope.
