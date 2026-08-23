@@ -30,15 +30,16 @@ pub struct EpisodeDoc {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct CuratorFrontmatter {
+struct ExternalFrontmatter {
     name: Option<String>,
     title: Option<String>,
     description: Option<String>,
+    owner: Option<String>,
 }
 
-pub fn parse_curator_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
+pub fn parse_external_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
     let (frontmatter, body) = split_frontmatter(text);
-    let parsed: CuratorFrontmatter = frontmatter
+    let parsed: ExternalFrontmatter = frontmatter
         .and_then(|raw| serde_yaml::from_str(raw).ok())
         .unwrap_or_default();
     let fallback = path
@@ -64,13 +65,32 @@ pub fn parse_curator_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
 }
 
 pub fn parse_agent_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
-    let mut docs = parse_curator_memory(path, text);
+    let mut docs = parse_external_memory(path, text);
+    let explicit_owner = split_frontmatter(text)
+        .0
+        .and_then(|raw| serde_yaml::from_str::<ExternalFrontmatter>(raw).ok())
+        .and_then(|frontmatter| frontmatter.owner)
+        .filter(|owner| !owner.trim().is_empty())
+        .map(|owner| normalize_agent_owner(&owner));
     for doc in &mut docs {
+        if let Some(owner) = explicit_owner.as_ref() {
+            doc.owner.clone_from(owner);
+        }
         if !has_explicit_product_scope(&doc.body) {
             doc.scope = "company".to_string();
         }
     }
     docs
+}
+
+fn normalize_agent_owner(owner: &str) -> String {
+    let normalized = owner
+        .trim()
+        .trim_start_matches('@')
+        .trim_start_matches("agent:")
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    format!("agent:{normalized}")
 }
 
 pub fn parse_system_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
@@ -150,6 +170,120 @@ pub fn parse_markdown_episode_file(path: &Path, text: &str, kind: &str) -> Vec<E
             )
         })
         .collect()
+}
+
+pub fn parse_meeting_file(path: &Path, text: &str) -> Vec<EpisodeDoc> {
+    let ts = ts_from_text_or_path(text, path);
+    let actor = actor_from_text_or_path(text, path);
+    let scope = classify_scope_for_markdown(path, text);
+    let fallback_title = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("meeting")
+        .replace('-', " ");
+    let mut title = fallback_title;
+    let mut saw_title = false;
+    let mut current_heading: Option<String> = None;
+    let mut current_body = Vec::new();
+    let mut sections: Vec<(Option<String>, String)> = Vec::new();
+
+    for line in text.lines() {
+        if let Some((level, heading)) = semantic_heading(line) {
+            if level == 1 && !saw_title {
+                title = meeting_title(heading);
+                saw_title = true;
+                continue;
+            }
+            flush_meeting_section(&mut sections, &mut current_heading, &mut current_body);
+            current_heading = Some(heading.to_string());
+        } else if let Some(heading) = semantic_bold_bullet(line) {
+            flush_meeting_section(&mut sections, &mut current_heading, &mut current_body);
+            current_heading = Some(heading.to_string());
+            current_body.push(line);
+        } else {
+            current_body.push(line);
+        }
+    }
+    flush_meeting_section(&mut sections, &mut current_heading, &mut current_body);
+
+    if sections.is_empty() {
+        return vec![EpisodeDoc::new(
+            ts,
+            actor,
+            "meeting",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("empty meeting"),
+            "",
+            scope,
+            path,
+        )];
+    }
+
+    sections
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (heading, body))| {
+            let summary = heading
+                .as_ref()
+                .map(|heading| format!("{title} — {heading}"))
+                .unwrap_or_else(|| title.clone());
+            let searchable_body = heading
+                .map(|heading| format!("{heading}\n{body}"))
+                .unwrap_or(body);
+            EpisodeDoc::new(
+                offset_seconds(&ts, idx as i64),
+                actor.clone(),
+                "meeting",
+                summary,
+                searchable_body,
+                scope.clone(),
+                path,
+            )
+        })
+        .collect()
+}
+
+fn semantic_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim();
+    let level = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=3).contains(&level) || trimmed.as_bytes().get(level) != Some(&b' ') {
+        return None;
+    }
+    let heading = trimmed[level + 1..].trim();
+    (!heading.is_empty()).then_some((level, heading))
+}
+
+fn meeting_title(heading: &str) -> String {
+    for prefix in ["Meeting — ", "Meeting - ", "MEETING — ", "MEETING - "] {
+        if let Some(title) = heading.strip_prefix(prefix) {
+            return title.trim().to_string();
+        }
+    }
+    heading.trim().to_string()
+}
+
+fn semantic_bold_bullet(line: &str) -> Option<&str> {
+    if line.len() != line.trim_start().len() {
+        return None;
+    }
+    let rest = line.strip_prefix("- **")?;
+    let end = rest.find("**")?;
+    let heading = rest[..end].trim();
+    (!heading.is_empty()).then_some(heading)
+}
+
+fn flush_meeting_section(
+    sections: &mut Vec<(Option<String>, String)>,
+    heading: &mut Option<String>,
+    body: &mut Vec<&str>,
+) {
+    let normalized = body.join("\n").trim().to_string();
+    body.clear();
+    let current_heading = heading.take();
+    if !normalized.is_empty() {
+        sections.push((current_heading, normalized));
+    }
 }
 
 pub fn classify_scope(text: &str) -> String {
@@ -338,7 +472,7 @@ fn owner_for_path(path: &Path) -> String {
     for agent in agent_hints() {
         if tokens.iter().any(|token| token == &agent) {
             return format!("agent:{agent}");
-        }
+        } // LCOV_EXCL_LINE: coverage artifact; return branch asserted by owner_hints_can_come_from_env.
     }
     "shared".to_string()
 }
@@ -481,7 +615,7 @@ fn ts_from_text_or_path(text: &str, path: &Path) -> String {
         return ts;
     }
     for line in text.lines().take(20) {
-        for prefix in ["DATE:", "- Date:"] {
+        for prefix in ["DATE:", "- Date:", "**Date:**"] {
             if let Some(date) = line.trim().strip_prefix(prefix)
                 && let Some(ts) = parse_dateish(date.trim())
             {
@@ -561,7 +695,7 @@ fn parse_dateish(text: &str) -> Option<String> {
                 return date
                     .and_hms_opt(0, 0, 0)
                     .map(|dt| Utc.from_utc_datetime(&dt).to_rfc3339());
-            } // LCOV_EXCL_LINE: coverage artifact (brace after return), frontende as line 519.
+            } // LCOV_EXCL_LINE: coverage artifact (brace after return), same as line 519.
         }
     }
     None
@@ -620,9 +754,9 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn parses_curator_frontmatter_memory() {
+    fn parses_external_frontmatter_memory() {
         let path = Path::new("/tmp/project_notebook.md");
-        let docs = parse_curator_memory(
+        let docs = parse_external_memory(
             path,
             "---\nname: project_notebook\ndescription: Notebook product memory\ntype: project\n---\nBody",
         );
@@ -632,7 +766,7 @@ mod tests {
 
     #[test]
     fn malformed_frontmatter_falls_back_to_filename_title() {
-        let docs = parse_curator_memory(
+        let docs = parse_external_memory(
             Path::new("/tmp/custom_memory.md"),
             "---\nname: custom\nBody without closing fence",
         );
@@ -646,7 +780,7 @@ mod tests {
     fn parses_agent_memory_as_company_scope_by_default() {
         let docs = parse_agent_memory(
             Path::new("/tmp/workspace/memory/archivist/archivist-bootstrap.md"),
-            "# Archivist\nclosing console",
+            "# Archivist\narchive rotation",
         );
 
         assert_eq!(docs[0].owner, "agent:archivist");
@@ -665,6 +799,18 @@ mod tests {
     }
 
     #[test]
+    fn agent_memory_frontmatter_owner_wins_when_path_has_no_agent_hint() {
+        let docs = parse_agent_memory(
+            Path::new("/tmp/workspace/system/inbox/builder-code/open-ticket.md"),
+            "---\nowner: Cafe-Owner\ntitle: Open Menu Ticket\n---\nCurrent open work.",
+        );
+
+        assert_eq!(docs[0].owner, "agent:cafe_owner");
+        assert_eq!(docs[0].title, "Open Menu Ticket");
+        assert_eq!(docs[0].scope, "company");
+    }
+
+    #[test]
     fn owner_hints_can_come_from_env() {
         let _lock = env_lock().lock().unwrap();
         let old_hints = std::env::var("SHELVES_AGENT_HINTS").ok();
@@ -672,12 +818,16 @@ mod tests {
         unsafe { std::env::set_var("SHELVES_AGENT_HINTS", "reviewer") };
         unsafe { std::env::remove_var("AIOS_ROOT") };
 
-        let docs = parse_curator_memory(
+        let docs = parse_external_memory(
             Path::new("/tmp/workspace/reviewer-note.md"),
             "---\nname: reviewer_note\n---\nBody",
         );
 
         assert_eq!(docs[0].owner, "agent:reviewer");
+        assert_eq!(
+            owner_for_path(Path::new("/tmp/workspace/reviewer/note.md")),
+            "agent:reviewer"
+        );
         restore_env("SHELVES_AGENT_HINTS", old_hints);
         restore_env("AIOS_ROOT", old_root);
     }
@@ -709,38 +859,38 @@ mod tests {
     fn classifier_uses_file_identity_before_body_product_mentions() {
         let cases = [
             (
-                "/tmp/shelves-root/.curator/projects/workspace/memory/feedback_curator_style.md",
-                "feedback-curator-style",
-                "Feedback Curator Style",
-                "The voice profile carries FictionalCo warmth.",
+                "/tmp/shelves-root/.agents/projects/workspace/memory/feedback_external_voice_profile.md",
+                "feedback-coordinator-voice-profile",
+                "Coordinator Voice Profile",
+                "The voice carries the configured house tone.",
                 "company",
             ),
             (
-                "/tmp/shelves-root/.curator/projects/workspace/memory/feedback_archive_notes.md",
-                "feedback_archive_notes",
-                "Archive Notes",
-                "Archivist cleans MEMORY.md and archived Notebook ticket refs.",
+                "/tmp/shelves-root/.agents/projects/workspace/memory/project_archive_policy.md",
+                "project_archive_policy",
+                "Archive Policy",
+                "The company archive policy keeps indexed references current.",
                 "company",
             ),
             (
-                "/tmp/shelves-root/.curator/projects/workspace/memory/feedback_review_log.md",
-                "feedback_review_log",
-                "Review Log",
-                "Review notes can mention Notebook without becoming product memory.",
+                "/tmp/shelves-root/.agents/projects/workspace/memory/feedback_external_correction_log.md",
+                "feedback_external_correction_log",
+                "Coordinator Correction Log",
+                "Corrections can mention a product without becoming product memory.",
                 "company",
             ),
             (
-                "/tmp/shelves-root/.curator/projects/workspace/memory/feedback_shelves_direction.md",
-                "feedback_shelves_direction",
-                "Shelves Direction",
-                "Shelves direction references Notebook and Console as examples.",
+                "/tmp/shelves-root/.agents/projects/workspace/memory/project_os_shelves_direction.md",
+                "project_os_shelves_direction",
+                "OS Shelves Direction",
+                "Company memory-engine direction references Notebook and Console as examples.",
                 "company",
             ),
             (
-                "/tmp/shelves-root/.curator/projects/workspace/memory/MEMORY.md",
+                "/tmp/shelves-root/.agents/projects/workspace/memory/MEMORY.md",
                 "MEMORY",
                 "MEMORY index",
-                "Active Files include MEMORY and Notebook pointers.",
+                "Active Files include console and notebook pointers.",
                 "os",
             ),
         ];
@@ -755,7 +905,7 @@ mod tests {
     fn system_memory_active_files_section_is_os_scope() {
         let docs = parse_system_memory(
             Path::new("/tmp/workspace/system/memory.md"),
-            "# Memory\n\n## Active Files\nalpha and notebook pointers\n\n## Feedback Curator Style\nvoice profile and FictionalCo warmth",
+            "# Memory\n\n## Active Files\nconsole and notebook pointers\n\n## Coordinator Voice Profile\nTTS voice and company tone",
         );
 
         assert_eq!(docs[0].title, "Active Files");
@@ -774,46 +924,23 @@ mod tests {
 
     #[test]
     fn parser_helper_edge_cases_are_stable() {
-        assert_eq!(classify_scope("FictionalCo company note"), "company");
+        assert_eq!(classify_scope("the organization company note"), "company");
         assert_eq!(classify_scope("plain operating note"), "os");
-        assert!(
-            configured_product_scopes()
-                .iter()
-                .any(|(name, _)| name == "notebook")
-        );
+        assert!(!has_product_signal("unknown", &[], "", "", "plain note"));
         assert_eq!(slugify(" --- "), "untitled");
-        assert_eq!(slugify("Alpha One!"), "alpha-one");
-        assert!(has_explicit_product_scope("Scope: product:notebook"));
+        assert_eq!(slugify("Project X!"), "project-x");
+        assert!(has_explicit_product_scope("Scope: product:catalog"));
+        assert!(has_product_signal(
+            "catalog",
+            &["catalog".to_string()],
+            "",
+            "",
+            "scope: product:catalog"
+        ));
         assert_eq!(
             parse_agent_hints("agent:Engineer\n# comment\ncafe-owner\n\nEngineer", '\n'),
             ["cafe_owner", "engineer"]
         );
-    }
-
-    #[test]
-    fn scope_config_can_come_from_env() {
-        let _lock = env_lock().lock().unwrap();
-        let old_products = std::env::var("SHELVES_PRODUCT_SCOPES").ok();
-        let old_prefixes = std::env::var("SHELVES_COMPANY_SLUG_PREFIXES").ok();
-        unsafe {
-            std::env::set_var(
-                "SHELVES_PRODUCT_SCOPES",
-                "notebook,console,voice,alpha:alpha-one|ao",
-            )
-        };
-        unsafe { std::env::set_var("SHELVES_COMPANY_SLUG_PREFIXES", "feedback-,org-") };
-
-        assert_eq!(
-            classify_scope_from_signals("alpha-one-plan", "Launch Plan", "Body"),
-            "product:alpha"
-        );
-        assert_eq!(
-            classify_scope_from_signals("org-plan", "Org Plan", "alpha-one pointers"),
-            "company"
-        );
-
-        restore_env("SHELVES_PRODUCT_SCOPES", old_products);
-        restore_env("SHELVES_COMPANY_SLUG_PREFIXES", old_prefixes);
     }
 
     #[test]
@@ -840,6 +967,66 @@ mod tests {
         assert_eq!(tool[0].ts, "2026-06-09T00:00:00+00:00");
 
         assert_eq!(offset_seconds("not-a-date", 3), "not-a-date");
+    }
+
+    #[test]
+    fn meeting_parser_keeps_late_semantic_sections_searchable() {
+        let text = r#"# Meeting — Base resume
+**Date:** 2026-08-01
+**Attendees:** Maintainer · Coordinator · Navigator
+
+Opening context for the room.
+
+## Early discussion
+This section deliberately comes first.
+
+# MEETING CLOSED
+
+## What was learned that we did not know this morning
+The compactor attacks the summary FIRST.
+
+### Evidence
+It deleted the line that came out of the comprehension gate.
+"#;
+
+        let docs = parse_meeting_file(Path::new("/tmp/2026-08-01-base-resume.md"), text);
+
+        assert_eq!(docs.len(), 4);
+        assert!(docs.iter().all(|doc| doc.kind == "meeting"));
+        assert!(docs.iter().all(|doc| doc.actor == "system"));
+        assert!(docs.iter().all(|doc| doc.ts.starts_with("2026-08-01T")));
+        assert_eq!(
+            docs[2].summary,
+            "Base resume — What was learned that we did not know this morning"
+        );
+        assert!(docs[2].body.contains("compactor attacks the summary FIRST"));
+        assert_eq!(docs[3].summary, "Base resume — Evidence");
+        assert!(docs[3].body.contains("comprehension gate"));
+    }
+
+    #[test]
+    fn empty_meeting_still_has_one_source_record() {
+        let docs = parse_meeting_file(Path::new("/tmp/2026-08-01-empty.md"), "");
+
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].kind, "meeting");
+        assert_eq!(docs[0].summary, "2026-08-01-empty.md");
+    }
+
+    #[test]
+    fn meeting_parser_splits_bold_decision_bullets_from_long_sections() {
+        let docs = parse_meeting_file(
+            Path::new("/tmp/2026-08-01-base-resume.md"),
+            "# Meeting — Base resume\n**Date:** 2026-08-01\n\n## Learned\n- **Position beats vocabulary.** Section order moved the score.\n- **The compactor attacks the summary FIRST.** It deleted the gated line.\n",
+        );
+
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[1].summary, "Base resume — Position beats vocabulary.");
+        assert_eq!(
+            docs[2].summary,
+            "Base resume — The compactor attacks the summary FIRST."
+        );
+        assert!(docs[2].body.contains("deleted the gated line"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -125,7 +126,8 @@ def test_context_pack_uses_locks_and_relevance_floor(workspace: dict[str, str]) 
     assert focused.returncode == 0, focused.stderr
     rows = json.loads(focused.stdout)
     titles = [row["title"] for row in rows]
-    assert "Testing Standard" in titles
+    assert "Checkout Retry Rule" in titles
+    assert rows[0]["section"] == "active-lock"
 
     unrelated = run_shelves(
         "context",
@@ -152,10 +154,64 @@ def test_missed_records_are_queryable(workspace: dict[str, str]) -> None:
 
     conn = sqlite3.connect(workspace["SHELVES_DB_PATH"])
     try:
-        row = conn.execute(
-            "SELECT actor, kind, summary FROM episodes WHERE kind='miss'"
-        ).fetchone()
+        row = conn.execute("SELECT actor, kind, summary FROM episodes WHERE kind='miss'").fetchone()
     finally:
         conn.close()
 
     assert row == ("agent:engineer", "miss", "checkout retry owner not recalled")
+
+
+def test_repeated_ingest_is_idempotent_and_changed_episode_body_is_observable(
+    workspace: dict[str, str], tmp_path: Path
+) -> None:
+    corpus = tmp_path / "corpus"
+    shutil.copytree(GOLDEN_FIXTURES, corpus)
+    env = {**workspace, "SHELVES_EXTRA_SOURCE_DIR": str(corpus)}
+    ingest_fixture_corpus(env)
+
+    conn = sqlite3.connect(env["SHELVES_DB_PATH"])
+    try:
+        first_count = conn.execute("SELECT COUNT(*) FROM episodes WHERE kind='ticket'").fetchone()[
+            0
+        ]
+    finally:
+        conn.close()
+
+    repeated = run_shelves("ingest", "--json", env=env)
+    assert repeated.returncode == 0, repeated.stderr
+    conn = sqlite3.connect(env["SHELVES_DB_PATH"])
+    try:
+        repeated_count = conn.execute(
+            "SELECT COUNT(*) FROM episodes WHERE kind='ticket'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert repeated_count == first_count
+
+    changed = corpus / "20260618-closeout.md"
+    changed.write_text(
+        changed.read_text(encoding="utf-8") + "Changed body remains observable.\n",
+        encoding="utf-8",
+    )
+    changed_ingest = run_shelves("ingest", "--json", env=env)
+    assert changed_ingest.returncode == 0, changed_ingest.stderr
+    conn = sqlite3.connect(env["SHELVES_DB_PATH"])
+    try:
+        changed_count = conn.execute(
+            "SELECT COUNT(*) FROM episodes WHERE kind='ticket'"
+        ).fetchone()[0]
+        changed_rows = conn.execute(
+            "SELECT COUNT(*) FROM episodes WHERE body LIKE '%Changed body remains observable%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert changed_count == first_count + 1
+    assert changed_rows == 1
+
+
+def test_miss_derived_goldens_are_labeled_synthetic() -> None:
+    cases = yaml.safe_load(GOLDEN.read_text(encoding="utf-8"))["queries"]
+    miss_cases = [case for case in cases if "miss_id" in case]
+
+    assert len(miss_cases) >= 2
+    assert all(str(case["miss_id"]).startswith("synthetic-") for case in miss_cases)

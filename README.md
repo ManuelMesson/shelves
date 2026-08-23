@@ -2,45 +2,58 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**A memory engine for multi-agent AI systems that doesn't store everything — it remembers what matters.**
+Shelves is a local-first, LLM-free memory engine for multi-agent workspaces. It
+derives a rebuildable SQLite/FTS index from canonical Markdown, then returns
+bounded context packs ranked by keyword relevance and activation.
 
-Most "agent memory" is a pile of chat logs you hope to grep later. Shelves is the opposite: a small, local-first, **LLM-free** engine that keeps the *durable* stuff — decisions, active context, and the misses it should learn from — and hands each agent a compact, ranked context pack for the task in front of it.
+It does not call a model, require embeddings, or replace canonical source
+files. The CLI and schema operate on paths, strings, and SQLite, so callers are
+not tied to a model provider.
 
-English-primary. Deterministic. No vector DB, no embeddings, no model calls — just keyword recall + activation scoring + write-once records, behind a stable CLI + SQLite contract.
+## What the engine implements
 
-> **we don't store — we remember.**
+- Deterministic keyword recall with activation and decay.
+- Write-once decision locks. Corrections supersede prior locks rather than
+  editing their bodies.
+- Product, company, and OS retrieval scopes with documented fall-through.
+- Agent-owned memory rows and configurable read filtering.
+- A required protected-root guard that refuses a configured path before file
+  walking.
+- Miss logging, miss review, and hermetic golden regressions.
+- Query-time locale packs; Spanish is bundled without changing stored content.
 
-## Shared memory, plus a private one for each agent
+## Scope, owner, and ACL are separate
 
-This is the part most agent memory misses. A shared log isn't personal; a private log isn't shared. A real team of agents needs both — the house knowledge everyone works from, and the context that belongs to one worker.
+`scope` is a retrieval bucket, not an agent identity:
 
-Shelves puts a **scope** on every memory, and recall falls through from narrow to broad:
+```text
+product:<name> -> company -> os
+company        -> product:* -> os
+os             -> company
+```
 
-> per-agent → product → company → OS
+Agent association lives in the separate `owner` field, such as
+`agent:planner`. Read filtering is handled by `node_acl`:
 
-An agent gets its own working context first, with the shared knowledge behind it — who's being served, how things are done, what's already been decided. One system, many agents; one memory, with private shelves inside.
+- `shared` rows and a caller's own rows are readable.
+- An explicit reader grant or revoke wins.
+- A wildcard rule applies when no explicit reader rule exists.
+- With no matching rule, access is allowed by default.
 
-*(A picture, if you want one: a counter where every barista shares the regulars, the recipes, and the house rules — but each still keeps their own notebook.)*
+The caller supplies `--as`; Shelves does not authenticate that identity. The
+ACL is therefore a configurable retrieval policy for a trusted local workspace,
+not a privacy, authorization, or multi-tenant security boundary. The
+protected-root guard prevents indexing one configured filesystem tree; it does
+not create private agent storage.
 
-## What's inside
+## Install and quickstart
 
-- **LLM-free recall** — search by task language; results rank by keyword relevance + activation, not embeddings. Fast, deterministic, debuggable, runs anywhere.
-- **Activation & decay** — every hit warms a memory; frequently-used memory stays hot, stale memory cools and ages toward archive, so context packs stay small and relevant.
-- **Write-once locks** — durable decisions are recorded once. Corrections *supersede* old locks instead of overwriting them — you can always see what was true, and when.
-- **Scoped recall** — per-agent → product → company → OS, with fall-through so the right context surfaces (see above).
-- **A boundary** — mark private paths and Shelves refuses to read them, before any access. Memory that respects a wall.
-
-## Install
+Rust 1.96.0 is pinned in `rust-toolchain.toml`.
 
 ```bash
 cargo build --release
-# binary: target/release/shelves
-```
 
-## Quickstart
-
-```bash
-mkdir -p demo/system demo/memory/planner demo/private
+mkdir -p demo/system demo/memory/planner demo/protected
 cat > demo/system/memory.md <<'EOF'
 ## Checkout Retry Rule
 LOCKED: checkout retries must be idempotent and tested.
@@ -48,46 +61,50 @@ EOF
 
 AIOS_ROOT="$PWD/demo" \
 SHELVES_DB_PATH="$PWD/demo/system/shelves.db" \
-SHELVES_PROTECTED_ROOT="$PWD/demo/private" \
+SHELVES_PROTECTED_ROOT="$PWD/demo/protected" \
 target/release/shelves ingest --reset --force
 
 AIOS_ROOT="$PWD/demo" \
 SHELVES_DB_PATH="$PWD/demo/system/shelves.db" \
-SHELVES_PROTECTED_ROOT="$PWD/demo/private" \
+SHELVES_PROTECTED_ROOT="$PWD/demo/protected" \
 target/release/shelves context planner "write checkout retry tests"
 ```
 
-You get back a ranked context pack — the locked rule, plus anything else relevant — for that exact task.
+See [Using Shelves](docs/USING_SHELVES.md) for sources, commands, locale packs,
+and the ACL contract.
+
+## Verify a clone
+
+Required development tools are Rust/Cargo, Python 3.12+, and `cargo-audit`
+0.22.2. Python packages are pinned in `requirements-dev.txt`.
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+cargo install cargo-audit --locked --version 0.22.2
+PATH="$PWD/.venv/bin:$PATH" ./scripts/check.sh
+```
+
+The last line is the single repository gate. It runs format, Clippy with
+warnings denied, all Rust tests, Ruff, Python tests, the public-content/path
+guard, and `cargo audit`. The same subcommands are named as separate steps in
+`.github/workflows/ci.yml` so a failing check is visible.
 
 ## Configuration
 
-| Env var | Purpose |
+| Variable | Purpose |
 |---|---|
-| `AIOS_ROOT` | Root of the workspace to index. |
-| `SHELVES_DB_PATH` | SQLite index path (default: `$AIOS_ROOT/system/shelves.db`). |
-| `SHELVES_PROTECTED_ROOT` | Private path Shelves refuses to read. |
-| `SHELVES_COMPANY_TOKENS` | Words that classify a memory as company scope (default: `company,organization,team`). |
-| `SHELVES_PRODUCT_SCOPES` | Product scope names and aliases (default: `notebook,console,voice`). |
-| `SHELVES_COMPANY_SLUG_PREFIXES` | Slug prefixes that force company scope (default: `feedback-`). |
+| `AIOS_ROOT` | Workspace root to index. |
+| `SHELVES_DB_PATH` | SQLite index path; defaults to `$AIOS_ROOT/system/shelves.db`. |
+| `SHELVES_PROTECTED_ROOT` | Required path that Shelves refuses before reading. |
+| `SHELVES_SOURCE_LIST` | Comma-separated enabled source names. |
+| `SHELVES_EXTRA_SOURCE_DIR` | Extra recursive Markdown source. |
+| `SHELVES_EXTERNAL_MEMORY_DIR` | Optional external memory directory. |
 | `SHELVES_AGENT_HINTS` | Agent names used for owner/actor detection. |
-| `SHELVES_SOURCE_LIST` | Source names to enable (empty = all defaults). |
-| `SHELVES_EXTRA_SOURCE_DIR` | Extra recursive Markdown source for imports. |
-| `SHELVES_CURATOR_MEMORY_DIR` | Optional external memory directory override. |
-
-## Develop
-
-```bash
-cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
-ruff check && pytest
-```
-
-## Why I built it
-
-I run a multi-agent system day to day, and the hard part was never getting the agents to talk — it was getting them to *remember the right things* without drowning in their own logs. Shelves is the memory layer I needed: small, deterministic, honest about what it keeps. It's the engine under my own work; I'm opening it because the idea — remember, don't hoard — is worth more shared than hidden.
-
-— Manuel Messon-Roque
+| `SHELVES_PRODUCT_SCOPES` | Product names and optional aliases used for scope classification. |
+| `SHELVES_COMPANY_TOKENS` | Body tokens used for company-scope classification. |
+| `SHELVES_COMPANY_SLUG_PREFIXES` | Slug prefixes used for company-scope classification. |
+| `SHELVES_LOCALE_DIR` | Optional directory of additional locale packs. |
 
 ## License
 

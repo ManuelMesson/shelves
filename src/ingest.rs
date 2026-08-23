@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde::Serialize;
 use walkdir::WalkDir;
 
@@ -43,8 +44,10 @@ enum SourcePath {
         relative: &'static str,
         recursive: bool,
     },
-    CuratorMemoryDir,
+    ExternalMemoryDir,
     AgentMemoryDirs,
+    AgentIdentityFiles,
+    OpenTicketFiles,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,12 +56,12 @@ struct SourceSpec {
     path: SourcePath,
 }
 
-const CURATOR_PROJECTS_RELATIVE_DIR: &str = ".curator/projects";
+const EXTERNAL_PROJECTS_RELATIVE_DIR: &str = ".agents/projects";
 
 const SOURCE_ROSTER: &[SourceSpec] = &[
     SourceSpec {
-        source: "curator-memory",
-        path: SourcePath::CuratorMemoryDir,
+        source: "external-memory",
+        path: SourcePath::ExternalMemoryDir,
     },
     SourceSpec {
         source: "system-memory",
@@ -76,9 +79,9 @@ const SOURCE_ROSTER: &[SourceSpec] = &[
         },
     },
     SourceSpec {
-        source: "archivist-reports",
+        source: "archive-reports",
         path: SourcePath::WorkspaceDir {
-            relative: "system/inbox/archivist-reports",
+            relative: "system/inbox/archive-reports",
             recursive: true,
         },
     },
@@ -97,12 +100,27 @@ const SOURCE_ROSTER: &[SourceSpec] = &[
         },
     },
     SourceSpec {
+        source: "open-tickets",
+        path: SourcePath::OpenTicketFiles,
+    },
+    SourceSpec {
         source: "agent-memory",
         path: SourcePath::AgentMemoryDirs,
     },
     SourceSpec {
+        source: "agent-identity",
+        path: SourcePath::AgentIdentityFiles,
+    },
+    SourceSpec {
         source: "lock-store",
         path: SourcePath::WorkspaceFile("system/locks.yaml"),
+    },
+    SourceSpec {
+        source: "meetings",
+        path: SourcePath::WorkspaceDir {
+            relative: "meetings",
+            recursive: false,
+        },
     },
 ];
 
@@ -146,13 +164,18 @@ pub fn run(conn: &mut Connection, reset: bool, source: Option<&str>) -> Result<I
             state.restore(conn)?;
         } // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    storage::drop_legacy_episode_idempotency_index(&tx)?;
+    let mut episode_deduper = storage::EpisodeDeduper::load(&tx)?;
+    if source.is_none() || source == Some("open-tickets") {
+        reconcile_open_ticket_memories(&tx, &files)?;
+    }
     let mut memories = 0;
     let mut episodes = 0;
     let mut skipped = 0;
 
     for file in &files {
-        match ingest_file(&tx, file) {
+        match ingest_file(&tx, &mut episode_deduper, file) {
             Ok((m, e)) => {
                 memories += m;
                 episodes += e;
@@ -316,15 +339,11 @@ fn count_promotion_audits(conn: &Connection) -> Result<usize> {
 }
 
 pub fn discover_source_files(source: Option<&str>) -> Result<Vec<SourceFile>> {
-    guard::require_personal_root()?;
+    guard::require_protected_root()?;
     let root = workspace_root()?;
     let mut out = Vec::new();
-    let enabled_sources = enabled_source_names();
 
     for spec in SOURCE_ROSTER {
-        if !enabled_sources.is_empty() && !enabled_sources.iter().any(|name| name == spec.source) {
-            continue;
-        }
         match spec.path {
             SourcePath::WorkspaceFile(relative) => {
                 push_file(&mut out, spec.source, &root.join(relative));
@@ -335,15 +354,16 @@ pub fn discover_source_files(source: Option<&str>) -> Result<Vec<SourceFile>> {
             } => {
                 push_dir(&mut out, spec.source, &root.join(relative), recursive);
             }
-            SourcePath::CuratorMemoryDir => {
-                push_dir(&mut out, spec.source, &curator_memory_dir(&root), false);
+            SourcePath::ExternalMemoryDir => {
+                push_dir(&mut out, spec.source, &external_memory_dir(&root), false);
             }
             SourcePath::AgentMemoryDirs => push_agent_memory_dirs(&mut out, &root),
+            SourcePath::AgentIdentityFiles => push_agent_identity_files(&mut out, &root),
+            SourcePath::OpenTicketFiles => push_open_ticket_files(&mut out, &root),
         }
     }
     if let Ok(extra_dir) = std::env::var("SHELVES_EXTRA_SOURCE_DIR")
         && !extra_dir.trim().is_empty()
-        && (enabled_sources.is_empty() || enabled_sources.iter().any(|name| name == "extra"))
     {
         push_dir(&mut out, "extra", Path::new(&extra_dir), true);
     }
@@ -355,17 +375,6 @@ pub fn discover_source_files(source: Option<&str>) -> Result<Vec<SourceFile>> {
     Ok(out)
 }
 
-fn enabled_source_names() -> Vec<String> {
-    let Ok(raw) = std::env::var("SHELVES_SOURCE_LIST") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 pub fn discover_paths(source: Option<&str>) -> Result<Vec<PathBuf>> {
     Ok(discover_source_files(source)?
         .into_iter()
@@ -373,13 +382,17 @@ pub fn discover_paths(source: Option<&str>) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-fn ingest_file(conn: &Connection, file: &SourceFile) -> Result<(usize, usize)> {
+fn ingest_file(
+    conn: &Connection,
+    episode_deduper: &mut storage::EpisodeDeduper,
+    file: &SourceFile,
+) -> Result<(usize, usize)> {
     let path = guard::assert_path_allowed_before_read(&file.path)?;
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     match file.source {
-        "curator-memory" => {
-            let docs = parser::parse_curator_memory(&path, &text);
+        "external-memory" => {
+            let docs = parser::parse_external_memory(&path, &text);
             ingest_memory_docs(conn, &path, &docs)?;
             Ok((docs.len(), 0))
         }
@@ -388,32 +401,40 @@ fn ingest_file(conn: &Connection, file: &SourceFile) -> Result<(usize, usize)> {
             ingest_memory_docs(conn, &path, &docs)?;
             Ok((docs.len(), 0))
         }
-        "agent-memory" => {
+        "agent-memory" | "agent-identity" | "open-tickets" => {
             let docs = parser::parse_agent_memory(&path, &text);
             ingest_memory_docs(conn, &path, &docs)?;
             Ok((docs.len(), 0))
         }
         "team-log" => {
             let docs = parser::parse_team_log(&path, &text);
+            let mut inserted = 0;
             for doc in &docs {
-                storage::insert_episode_if_new(conn, doc)?;
+                if episode_deduper.insert_if_new(conn, doc)?.is_some() {
+                    inserted += 1;
+                }
             }
-            Ok((0, docs.len()))
+            Ok((0, inserted))
         }
-        "handoffs" => ingest_episode_file(conn, &path, &text, "handoff"),
-        "archivist-reports" => ingest_episode_file(conn, &path, &text, "archivist-report"),
-        "agent-to-agent" => ingest_episode_file(conn, &path, &text, "agent-to-agent"),
-        "processed-tickets" => ingest_episode_file(conn, &path, &text, "ticket"),
+        "handoffs" => ingest_episode_file(conn, episode_deduper, &path, &text, "handoff"),
+        "archive-reports" => {
+            ingest_episode_file(conn, episode_deduper, &path, &text, "archivist-report")
+        }
+        "agent-to-agent" => {
+            ingest_episode_file(conn, episode_deduper, &path, &text, "agent-to-agent")
+        }
+        "processed-tickets" => ingest_episode_file(conn, episode_deduper, &path, &text, "ticket"),
+        "meetings" => ingest_meeting_file(conn, episode_deduper, &path, &text),
         "lock-store" => {
             locks::ingest_lock_store(conn, &path)?;
             Ok((0, 0))
         }
         "extra" if text.trim_start().starts_with("---") => {
-            let docs = parser::parse_curator_memory(&path, &text);
+            let docs = parser::parse_external_memory(&path, &text);
             ingest_memory_docs(conn, &path, &docs)?;
             Ok((docs.len(), 0))
         }
-        "extra" => ingest_episode_file(conn, &path, &text, "ticket"),
+        "extra" => ingest_episode_file(conn, episode_deduper, &path, &text, "ticket"),
         _ => Ok((0, 0)),
     }
 }
@@ -428,17 +449,93 @@ fn ingest_memory_docs(conn: &Connection, path: &Path, docs: &[parser::MemoryDoc]
     Ok(docs.len())
 }
 
+fn reconcile_open_ticket_memories(conn: &Connection, files: &[SourceFile]) -> Result<usize> {
+    let root = workspace_root()?;
+    let ticket_root = root.join("system/inbox/builder-code");
+    let live_paths = files
+        .iter()
+        .filter(|file| file.source == "open-tickets")
+        .map(|file| file.path.as_path())
+        .collect::<std::collections::HashSet<_>>();
+    let mut stale_ids = Vec::new();
+    let mut stmt = conn.prepare("SELECT id, source_path FROM memories WHERE is_lock = 0")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, source_path) = row?;
+        let path = Path::new(&source_path);
+        if path.parent() == Some(ticket_root.as_path()) && !live_paths.contains(path) {
+            stale_ids.push(id);
+        }
+    }
+    drop(stmt);
+    let now = chrono::Utc::now().to_rfc3339();
+    for id in &stale_ids {
+        conn.execute(
+            "UPDATE memories SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?; // LCOV_EXCL_LINE: SQL error branch; successful archive asserted below.
+    }
+    Ok(stale_ids.len())
+}
+
 fn ingest_episode_file(
     conn: &Connection,
+    episode_deduper: &mut storage::EpisodeDeduper,
     path: &Path,
     text: &str,
     kind: &str,
 ) -> Result<(usize, usize)> {
     let docs = parser::parse_markdown_episode_file(path, text, kind);
+    let mut inserted = 0;
     for doc in &docs {
-        storage::insert_episode_if_new(conn, doc)?;
+        if episode_deduper.insert_if_new(conn, doc)?.is_some() {
+            inserted += 1;
+        }
     }
-    Ok((0, docs.len()))
+    Ok((0, inserted))
+}
+
+fn ingest_meeting_file(
+    conn: &Connection,
+    episode_deduper: &mut storage::EpisodeDeduper,
+    path: &Path,
+    text: &str,
+) -> Result<(usize, usize)> {
+    let docs = parser::parse_meeting_file(path, text);
+    let present = docs
+        .iter()
+        .map(|doc| (doc.summary.clone(), doc.body.clone()))
+        .collect::<HashSet<_>>();
+    let source_path = path.to_string_lossy();
+    let mut stmt = conn.prepare(
+        "SELECT id, summary, body FROM episodes WHERE kind='meeting' AND source_path=?1",
+    )?; // LCOV_EXCL_LINE: prepare error path; successful reconciliation is asserted by meeting ingest tests.
+    let rows = stmt.query_map(params![source_path.as_ref()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let existing = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let stale_ids = existing
+        .into_iter()
+        .filter_map(|(id, summary, body)| (!present.contains(&(summary, body))).then_some(id))
+        .collect::<Vec<_>>();
+    drop(stmt);
+    for id in stale_ids {
+        conn.execute("DELETE FROM episodes WHERE id=?1", params![id])?;
+    }
+
+    let mut inserted = 0;
+    for doc in &docs {
+        if episode_deduper.insert_if_new(conn, doc)?.is_some() {
+            inserted += 1;
+        }
+    }
+    Ok((0, inserted))
 }
 
 fn push_file(out: &mut Vec<SourceFile>, source: &'static str, path: &Path) {
@@ -470,20 +567,20 @@ fn push_dir(out: &mut Vec<SourceFile>, source: &'static str, dir: &Path, recursi
     }
 }
 
-fn curator_memory_dir(root: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("SHELVES_CURATOR_MEMORY_DIR")
+fn external_memory_dir(root: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("SHELVES_EXTERNAL_MEMORY_DIR")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
     root.parent()
         .unwrap_or(root)
-        .join(CURATOR_PROJECTS_RELATIVE_DIR)
-        .join(curator_project_slug(root))
+        .join(EXTERNAL_PROJECTS_RELATIVE_DIR)
+        .join(external_project_slug(root))
         .join("memory")
 }
 
-fn curator_project_slug(root: &Path) -> String {
+fn external_project_slug(root: &Path) -> String {
     let normalized = root
         .components()
         .filter_map(|component| component.as_os_str().to_str())
@@ -509,6 +606,81 @@ fn push_agent_memory_dirs(out: &mut Vec<SourceFile>, root: &Path) {
     }
 }
 
+fn push_agent_identity_files(out: &mut Vec<SourceFile>, root: &Path) {
+    let identity_root = root.join("agents");
+    let known_agents = known_agent_names(root);
+    let Ok(entries) = std::fs::read_dir(identity_root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("md")
+            && file_names_known_agent(&path, &known_agents)
+        {
+            out.push(SourceFile {
+                source: "agent-identity",
+                path,
+            });
+        }
+    }
+}
+
+fn push_open_ticket_files(out: &mut Vec<SourceFile>, root: &Path) {
+    let ticket_root = root.join("system/inbox/builder-code");
+    let known_agents = known_agent_names(root);
+    let Ok(entries) = std::fs::read_dir(ticket_root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("md")
+            && file_names_known_agent(&path, &known_agents)
+        {
+            out.push(SourceFile {
+                source: "open-tickets",
+                path,
+            });
+        }
+    }
+}
+
+fn file_names_known_agent(path: &Path, known_agents: &std::collections::HashSet<String>) -> bool {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| known_agents.contains(&token))
+}
+
+fn known_agent_names(root: &Path) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if let Ok(raw) = std::fs::read_to_string(root.join("system/agents.txt")) {
+        names.extend(
+            raw.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(|line| {
+                    line.trim_start_matches("agent:")
+                        .to_ascii_lowercase()
+                        .replace('-', "_")
+                }),
+        );
+    }
+    if let Ok(entries) = std::fs::read_dir(root.join("memory")) {
+        names.extend(entries.filter_map(Result::ok).filter_map(|entry| {
+            entry.path().is_dir().then(|| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .replace('-', "_")
+            })
+        }));
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,36 +691,51 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn source_discovery_uses_aios_root_for_curator_and_agent_memory() {
+    fn source_discovery_uses_aios_root_for_agent_owned_sources() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let personal = tmp.path().join("private-root");
-        let curator_dir = tmp.path().join("curator-memory");
+        let protected = tmp.path().join("protected-os");
+        let external_dir = tmp.path().join("external-memory");
         let synthetic_agent_dir = root.join("memory/cafe-owner");
-        std::fs::create_dir_all(&personal).unwrap();
-        std::fs::create_dir_all(&curator_dir).unwrap();
+        let identity_dir = root.join("agents");
+        let ticket_dir = root.join("system/inbox/builder-code");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
         std::fs::create_dir_all(&synthetic_agent_dir).unwrap();
-        let curator_file = curator_dir.join("project_cafe.md");
+        std::fs::create_dir_all(&identity_dir).unwrap();
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        let external_file = external_dir.join("project_cafe.md");
         let agent_file = synthetic_agent_dir.join("menu.md");
-        std::fs::write(&curator_file, "# Cafe\n").unwrap();
+        let identity_file = identity_dir.join("cafe-owner.md");
+        let roster_file = identity_dir.join("ROSTER.md");
+        let ticket_file = ticket_dir.join("20260820T010000Z-cafe-owner-menu.md");
+        std::fs::write(&external_file, "# Cafe\n").unwrap();
         std::fs::write(&agent_file, "# Menu\n").unwrap();
+        std::fs::write(root.join("system/agents.txt"), "cafe\n").unwrap();
+        std::fs::write(&identity_file, "# Cafe Owner\n").unwrap();
+        std::fs::write(&roster_file, "# Roster\n").unwrap();
+        std::fs::write(&ticket_file, "---\nowner: cafe\n---\nOpen menu work.\n").unwrap();
 
         let old_root = std::env::var("AIOS_ROOT").ok();
-        let old_personal = std::env::var("SHELVES_PROTECTED_ROOT").ok();
-        let old_curator = std::env::var("SHELVES_CURATOR_MEMORY_DIR").ok();
+        let old_protected = std::env::var("SHELVES_PROTECTED_ROOT").ok();
+        let old_external = std::env::var("SHELVES_EXTERNAL_MEMORY_DIR").ok();
         unsafe { std::env::set_var("AIOS_ROOT", root) };
-        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
-        unsafe { std::env::set_var("SHELVES_CURATOR_MEMORY_DIR", &curator_dir) };
+        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
+        unsafe { std::env::set_var("SHELVES_EXTERNAL_MEMORY_DIR", &external_dir) };
 
-        let curator_paths = discover_paths(Some("curator-memory")).unwrap();
+        let external_paths = discover_paths(Some("external-memory")).unwrap();
         let agent_paths = discover_paths(Some("agent-memory")).unwrap();
-        assert_eq!(curator_paths, vec![curator_file]);
+        let identity_paths = discover_paths(Some("agent-identity")).unwrap();
+        let open_ticket_paths = discover_paths(Some("open-tickets")).unwrap();
+        assert_eq!(external_paths, vec![external_file]);
         assert_eq!(agent_paths, vec![agent_file]);
+        assert_eq!(identity_paths, vec![identity_file]);
+        assert_eq!(open_ticket_paths, vec![ticket_file]);
 
         restore_env("AIOS_ROOT", old_root);
-        restore_env("SHELVES_PROTECTED_ROOT", old_personal);
-        restore_env("SHELVES_CURATOR_MEMORY_DIR", old_curator);
+        restore_env("SHELVES_PROTECTED_ROOT", old_protected);
+        restore_env("SHELVES_EXTERNAL_MEMORY_DIR", old_external);
     }
 
     #[test]
@@ -558,17 +745,17 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
-        let personal = tmp.path().join("private-root");
+        let protected = tmp.path().join("protected-os");
         let extra = tmp.path().join("extra-source");
         std::fs::create_dir_all(root.join("system")).unwrap();
-        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
         std::fs::create_dir_all(extra.join("nested")).unwrap();
         std::fs::write(root.join("system/memory.md"), "# System\n").unwrap();
         std::fs::write(extra.join("b.md"), "B\n").unwrap();
         std::fs::write(extra.join("a.md"), "A\n").unwrap();
         std::fs::write(extra.join("nested/c.md"), "C\n").unwrap();
         std::fs::write(extra.join("ignored.txt"), "ignored\n").unwrap();
-        let _env = EnvGuard::new(&root, &personal);
+        let _env = EnvGuard::new(&root, &protected);
         unsafe { std::env::set_var("SHELVES_EXTRA_SOURCE_DIR", &extra) };
 
         let extra_files = discover_source_files(Some("extra")).unwrap();
@@ -596,57 +783,134 @@ mod tests {
     }
 
     #[test]
-    fn missing_personal_root_refuses_source_file_walk() {
+    fn full_ingest_removes_memories_for_tickets_no_longer_open() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        let protected = tmp.path().join("protected-os");
+        let ticket_dir = root.join("system/inbox/builder-code");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(root.join("system/agents.txt"), "engineer\n").unwrap();
+        std::fs::write(
+            root.join("system/memory.md"),
+            "# Synthetic\n\n## Stable\nStable shared memory.\n",
+        )
+        .unwrap();
+        let ticket = ticket_dir.join("20260820T010000Z-engineer-open.md");
+        std::fs::write(
+            &ticket,
+            "---\nowner: engineer\ntitle: Engineer Open Ticket\n---\nCurrent open work.\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::new(&root, &protected);
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        run(&mut conn, false, None).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE title = 'Engineer Open Ticket'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1);
+
+        std::fs::remove_file(ticket).unwrap();
+        run(&mut conn, false, None).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE title = 'Engineer Open Ticket' AND status != 'archived'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0);
+    }
+
+    #[test]
+    fn meetings_source_discovers_markdown_and_ingests_sections_idempotently() {
+        let _lock = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        let protected = tmp.path().join("protected-os");
+        let meetings = root.join("meetings");
+        std::fs::create_dir_all(&meetings).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
+        let meeting = meetings.join("2026-08-01-base-resume.md");
+        std::fs::write(
+            &meeting,
+            "# Meeting — Base resume\n**Date:** 2026-08-01\n\n## Decision\nThe compactor attacks the summary FIRST.\n",
+        )
+        .unwrap();
+        std::fs::write(meetings.join("ignored.txt"), "not markdown").unwrap();
+        let _env = EnvGuard::new(&root, &protected);
+        let mut conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        let files = discover_source_files(Some("meetings")).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].source, "meetings");
+        assert_eq!(files[0].path, meeting);
+
+        let first = run(&mut conn, false, Some("meetings")).unwrap();
+        assert_eq!(first.memories, 0);
+        assert_eq!(first.episodes, 2);
+        assert_eq!(first.skipped, 0);
+        let second = run(&mut conn, false, Some("meetings")).unwrap();
+        assert_eq!(second.episodes, 0);
+
+        std::fs::write(
+            &meeting,
+            "# Meeting — Base resume\n**Date:** 2026-08-01\n\n## Decision\nThe compactor preserves the summary now.\n",
+        )
+        .unwrap();
+        let changed = run(&mut conn, false, Some("meetings")).unwrap();
+        assert_eq!(changed.episodes, 1);
+
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episodes WHERE kind='meeting' AND source_path=?1",
+                params![meeting.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 2);
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episodes WHERE kind='meeting' AND body LIKE '%attacks%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    #[test]
+    fn missing_protected_root_refuses_source_file_walk() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
         std::fs::create_dir_all(&root).unwrap();
         let old_root = std::env::var("AIOS_ROOT").ok();
-        let old_personal = std::env::var("SHELVES_PROTECTED_ROOT").ok();
+        let old_protected = std::env::var("SHELVES_PROTECTED_ROOT").ok();
         let old_extra = std::env::var("SHELVES_EXTRA_SOURCE_DIR").ok();
-        let old_source_list = std::env::var("SHELVES_SOURCE_LIST").ok();
         unsafe {
             std::env::set_var("AIOS_ROOT", &root);
             std::env::remove_var("SHELVES_PROTECTED_ROOT");
             std::env::remove_var("SHELVES_EXTRA_SOURCE_DIR");
-            std::env::remove_var("SHELVES_SOURCE_LIST");
         }
 
         let err = discover_source_files(Some("system-memory"))
             .expect_err("missing SHELVES_PROTECTED_ROOT must refuse before walking sources");
 
         assert!(err.to_string().contains(
-            "SHELVES_PROTECTED_ROOT is required for Layer-1 protection; refusing file walk"
+            "SHELVES_PROTECTED_ROOT is required for protected-path enforcement; refusing file walk"
         ));
         restore_env("AIOS_ROOT", old_root);
-        restore_env("SHELVES_PROTECTED_ROOT", old_personal);
+        restore_env("SHELVES_PROTECTED_ROOT", old_protected);
         restore_env("SHELVES_EXTRA_SOURCE_DIR", old_extra);
-        restore_env("SHELVES_SOURCE_LIST", old_source_list);
-    }
-
-    #[test]
-    fn source_list_config_filters_default_sources_and_extra() {
-        let _lock = env_lock().lock().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("workspace");
-        let personal = tmp.path().join("private-root");
-        let extra = tmp.path().join("extra-source");
-        std::fs::create_dir_all(root.join("system")).unwrap();
-        std::fs::create_dir_all(&personal).unwrap();
-        std::fs::create_dir_all(&extra).unwrap();
-        std::fs::write(root.join("system/memory.md"), "## System\nBody\n").unwrap();
-        std::fs::write(extra.join("extra.md"), "Extra\n").unwrap();
-        let _env = EnvGuard::new(&root, &personal);
-        unsafe {
-            std::env::set_var("SHELVES_EXTRA_SOURCE_DIR", &extra);
-            std::env::set_var("SHELVES_SOURCE_LIST", "system-memory");
-        }
-
-        let files = discover_source_files(None).unwrap();
-
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].source, "system-memory");
-        assert_eq!(files[0].path, root.join("system/memory.md"));
     }
 
     #[test]
@@ -656,10 +920,10 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("empty-workspace");
-        let personal = tmp.path().join("private-root");
+        let protected = tmp.path().join("protected-os");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&personal).unwrap();
-        let _env = EnvGuard::new(&root, &personal);
+        std::fs::create_dir_all(&protected).unwrap();
+        let _env = EnvGuard::new(&root, &protected);
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
 
@@ -681,15 +945,15 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("reset-workspace");
-        let personal = tmp.path().join("private-root");
+        let protected = tmp.path().join("protected-os");
         std::fs::create_dir_all(root.join("system")).unwrap();
-        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
         std::fs::write(
             root.join("system/memory.md"),
             "## Reset Source\nReset source body for ingest.\n",
         )
         .unwrap();
-        let _env = EnvGuard::new(&root, &personal);
+        let _env = EnvGuard::new(&root, &protected);
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         storage::insert_future_item(&conn, "durable future", "2026-06-30", "agent:engineer")
@@ -697,7 +961,7 @@ mod tests {
         storage::insert_miss(&conn, "durable miss", "agent:engineer").unwrap();
         conn.execute(
             "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
-             VALUES('2026-06-15T00:00:00Z', 'agent:curator', 'promotion', 'audit', 'audit', 'company', '')",
+             VALUES('2026-06-15T00:00:00Z', 'agent:coordinator', 'promotion', 'audit', 'audit', 'company', '')",
             [],
         )
         .unwrap();
@@ -740,21 +1004,21 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
-        let personal = tmp.path().join("private-root");
+        let protected = tmp.path().join("protected-os");
         std::fs::create_dir_all(root.join("system")).unwrap();
-        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
         let memory = root.join("system/memory.md");
         std::fs::write(
             &memory,
-            "## Old Note\nfirst body.\n\n## Keep Me\nStill here.\n",
+            "## Old Note\nOriginal body.\n\n## Keep Me\nStill here.\n",
         )
         .unwrap();
-        let _env = EnvGuard::new(&root, &personal);
+        let _env = EnvGuard::new(&root, &protected);
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
 
         run(&mut conn, false, Some("system-memory")).unwrap();
-        std::fs::write(&memory, "## New Note\nsecond body.\n").unwrap();
+        std::fs::write(&memory, "## New Note\nUpdated body.\n").unwrap();
         run(&mut conn, false, Some("system-memory")).unwrap();
 
         let rows = memory_status_rows(&conn);
@@ -768,16 +1032,16 @@ mod tests {
         // Covers the skip-vs-fail policy at lines 154-167.
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("private-root");
-        let root = personal.join("workspace-inside-layer1");
+        let protected = tmp.path().join("protected-os");
+        let root = protected.join("workspace-inside-layer1");
         std::fs::create_dir_all(root.join("system")).unwrap();
         std::fs::write(
             root.join("system/memory.md"),
-            "## Refused\nLayer-1 source.\n",
+            "## Refused\nprotected source.\n",
         )
         .unwrap();
         std::fs::write(root.join("system/locks.yaml"), "# lock store\n").unwrap();
-        let _env = EnvGuard::new(&root, &personal);
+        let _env = EnvGuard::new(&root, &protected);
         let mut conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
 
@@ -796,10 +1060,10 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("workspace");
-        let personal = tmp.path().join("private-root");
+        let protected = tmp.path().join("protected-os");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&personal).unwrap();
-        let _env = EnvGuard::new(&root, &personal);
+        std::fs::create_dir_all(&protected).unwrap();
+        let _env = EnvGuard::new(&root, &protected);
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
 
@@ -809,8 +1073,10 @@ mod tests {
             "---\nname: extra_memory\ntitle: Extra Memory\n---\nBody",
         )
         .unwrap();
+        let mut episode_deduper = storage::EpisodeDeduper::load(&conn).unwrap();
         let (memories, episodes) = ingest_file(
             &conn,
+            &mut episode_deduper,
             &SourceFile {
                 source: "extra",
                 path: extra,
@@ -819,11 +1085,50 @@ mod tests {
         .unwrap();
         assert_eq!((memories, episodes), (1, 0));
 
+        let coordinator = root.join("external-memory.md");
+        std::fs::write(
+            &coordinator,
+            "---\nname: external_memory\ntitle: Coordinator Memory\n---\nBody",
+        )
+        .unwrap();
+        assert_eq!(
+            ingest_file(
+                &conn,
+                &mut episode_deduper,
+                &SourceFile {
+                    source: "external-memory",
+                    path: coordinator,
+                },
+            )
+            .unwrap(),
+            (1, 0)
+        );
+
+        let agent_to_agent = root.join("agent-to-agent.md");
+        std::fs::write(
+            &agent_to_agent,
+            "DATE: 2026-07-29\nFixture agent-to-agent ping",
+        )
+        .unwrap();
+        assert_eq!(
+            ingest_file(
+                &conn,
+                &mut episode_deduper,
+                &SourceFile {
+                    source: "agent-to-agent",
+                    path: agent_to_agent,
+                },
+            )
+            .unwrap(),
+            (0, 2)
+        );
+
         let unknown = root.join("unknown.md");
         std::fs::write(&unknown, "ignored").unwrap();
         assert_eq!(
             ingest_file(
                 &conn,
+                &mut episode_deduper,
                 &SourceFile {
                     source: "unknown",
                     path: unknown,
@@ -833,8 +1138,8 @@ mod tests {
             (0, 0)
         );
 
-        let default_dir = curator_memory_dir(&root);
-        assert!(default_dir.to_string_lossy().contains(".curator/projects/"));
+        let default_dir = external_memory_dir(&root);
+        assert!(default_dir.to_string_lossy().contains(".agents/projects/"));
         assert!(default_dir.ends_with("memory"));
     }
 
@@ -866,14 +1171,13 @@ mod tests {
     }
 
     impl EnvGuard {
-        fn new(root: &Path, personal: &Path) -> Self {
+        fn new(root: &Path, protected: &Path) -> Self {
             let keys = [
                 "AIOS_ROOT",
                 "SHELVES_PROTECTED_ROOT",
                 "SHELVES_DB_PATH",
-                "SHELVES_CURATOR_MEMORY_DIR",
+                "SHELVES_EXTERNAL_MEMORY_DIR",
                 "SHELVES_EXTRA_SOURCE_DIR",
-                "SHELVES_SOURCE_LIST",
             ];
             let old_values = keys
                 .into_iter()
@@ -881,11 +1185,10 @@ mod tests {
                 .collect();
             unsafe {
                 std::env::set_var("AIOS_ROOT", root);
-                std::env::set_var("SHELVES_PROTECTED_ROOT", personal);
+                std::env::set_var("SHELVES_PROTECTED_ROOT", protected);
                 std::env::set_var("SHELVES_DB_PATH", root.join("system/shelves.db"));
-                std::env::remove_var("SHELVES_CURATOR_MEMORY_DIR");
+                std::env::remove_var("SHELVES_EXTERNAL_MEMORY_DIR");
                 std::env::remove_var("SHELVES_EXTRA_SOURCE_DIR");
-                std::env::remove_var("SHELVES_SOURCE_LIST");
             }
             Self { old_values }
         }

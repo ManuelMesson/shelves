@@ -10,21 +10,23 @@ pub struct GuardViolation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardError {
-    MissingPersonalRoot,
+    MissingProtectedRoot,
     Violation(GuardViolation),
 }
 
 pub fn check_path(path: &Path) -> Result<PathBuf> {
     match canonical_allowed_path(path) {
         Ok(path) => Ok(path),
-        Err(GuardError::MissingPersonalRoot) => {
-            bail!("SHELVES_PROTECTED_ROOT is required for Layer-1 protection; refusing file access")
+        Err(GuardError::MissingProtectedRoot) => {
+            bail!(
+                "SHELVES_PROTECTED_ROOT is required for protected-path enforcement; refusing file access"
+            )
         }
         Err(GuardError::Violation(GuardViolation {
             path,
             protected_root,
         })) => bail!(
-            "Layer-1 path refused: {} is under {}",
+            "protected path refused: {} is under {}",
             path.display(),
             protected_root.display()
         ),
@@ -55,27 +57,27 @@ pub fn assert_path_allowed_before_read(path: &Path) -> Result<PathBuf> {
     check_path(path).with_context(|| format!("refusing to read {}", path.display()))
 }
 
-pub fn require_personal_root() -> Result<PathBuf> {
-    let personal_root = std::env::var("SHELVES_PROTECTED_ROOT").map_err(|_| {
+pub fn require_protected_root() -> Result<PathBuf> {
+    let protected_root = std::env::var("SHELVES_PROTECTED_ROOT").map_err(|_| {
         anyhow::anyhow!(
-            "SHELVES_PROTECTED_ROOT is required for Layer-1 protection; refusing file walk"
+            "SHELVES_PROTECTED_ROOT is required for protected-path enforcement; refusing file walk"
         )
     })?;
-    if personal_root.trim().is_empty() {
+    if protected_root.trim().is_empty() {
         bail!("SHELVES_PROTECTED_ROOT is required and must not be empty");
     }
-    let lexical = lexical_absolute(Path::new(&personal_root));
+    let lexical = lexical_absolute(Path::new(&protected_root));
     Ok(canonical_existing_prefix(&lexical))
 }
 
 fn protected_roots() -> std::result::Result<Vec<PathBuf>, GuardError> {
-    let Ok(personal_root) = std::env::var("SHELVES_PROTECTED_ROOT") else {
-        return Err(GuardError::MissingPersonalRoot);
+    let Ok(protected_root) = std::env::var("SHELVES_PROTECTED_ROOT") else {
+        return Err(GuardError::MissingProtectedRoot);
     };
-    if personal_root.trim().is_empty() {
-        return Err(GuardError::MissingPersonalRoot);
+    if protected_root.trim().is_empty() {
+        return Err(GuardError::MissingProtectedRoot);
     }
-    let lexical = lexical_absolute(Path::new(&personal_root));
+    let lexical = lexical_absolute(Path::new(&protected_root));
     let mut roots = vec![canonical_existing_prefix(&lexical)];
     roots.sort();
     roots.dedup();
@@ -151,14 +153,14 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn missing_personal_root_refuses_file_access() {
+    fn missing_protected_root_refuses_file_access() {
         let _lock = env_lock().lock().unwrap();
         let old = std::env::var("SHELVES_PROTECTED_ROOT").ok();
         unsafe { std::env::remove_var("SHELVES_PROTECTED_ROOT") };
         let err =
             canonical_allowed_path(Path::new("/tmp/clean")).expect_err("missing env must refuse");
-        assert_eq!(err, GuardError::MissingPersonalRoot);
-        restore_personal_root(old);
+        assert_eq!(err, GuardError::MissingProtectedRoot);
+        restore_protected_root(old);
     }
 
     #[test]
@@ -174,95 +176,95 @@ mod tests {
         );
 
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("personal");
-        std::fs::create_dir_all(&personal).unwrap();
+        let protected = tmp.path().join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
         unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", " ") };
-        let blank = require_personal_root().expect_err("blank env must fail");
+        let blank = require_protected_root().expect_err("blank env must fail");
         assert!(blank.to_string().contains("must not be empty"));
 
-        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
+        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
         let refused =
-            assert_path_allowed_before_read(&personal).expect_err("protected root must refuse");
+            assert_path_allowed_before_read(&protected).expect_err("protected root must refuse");
         assert!(refused.to_string().contains("refusing to read"));
-        assert!(format!("{refused:#}").contains("Layer-1 path refused"));
-        restore_personal_root(old);
+        assert!(format!("{refused:#}").contains("protected path refused"));
+        restore_protected_root(old);
     }
 
     #[test]
-    fn blank_personal_root_refuses_file_access() {
+    fn blank_protected_root_refuses_file_access() {
         let _lock = env_lock().lock().unwrap();
         let old = std::env::var("SHELVES_PROTECTED_ROOT").ok();
         unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", " ") };
         let err =
             canonical_allowed_path(Path::new("/tmp/clean")).expect_err("blank env must refuse");
-        assert_eq!(err, GuardError::MissingPersonalRoot);
-        restore_personal_root(old);
+        assert_eq!(err, GuardError::MissingProtectedRoot);
+        restore_protected_root(old);
     }
 
     #[test]
-    fn direct_personal_root_path_is_refused_without_reading_contents() {
+    fn direct_protected_root_path_is_refused_without_reading_contents() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("personal");
-        std::fs::create_dir_all(&personal).unwrap();
+        let protected = tmp.path().join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
         let old = std::env::var("SHELVES_PROTECTED_ROOT").ok();
-        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
-        let err = canonical_allowed_path(&personal).expect_err("protected root must be refused");
+        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
+        let err = canonical_allowed_path(&protected).expect_err("protected root must be refused");
         assert_eq!(
             violation_root(err),
-            std::fs::canonicalize(&personal).unwrap()
+            std::fs::canonicalize(&protected).unwrap()
         );
-        restore_personal_root(old);
+        restore_protected_root(old);
     }
 
     #[test]
-    fn symlink_into_personal_root_is_refused() {
+    fn symlink_into_protected_root_is_refused() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("personal");
+        let protected = tmp.path().join("protected");
         let clean = tmp.path().join("clean");
-        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
         std::fs::create_dir_all(&clean).unwrap();
         let link = clean.join("link");
-        std::os::unix::fs::symlink(&personal, &link).unwrap();
+        std::os::unix::fs::symlink(&protected, &link).unwrap();
 
         let old = std::env::var("SHELVES_PROTECTED_ROOT").ok();
-        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
+        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
         let err = canonical_allowed_path(&link).expect_err("symlink target must be refused");
         assert_eq!(
             violation_root(err),
-            std::fs::canonicalize(&personal).unwrap()
+            std::fs::canonicalize(&protected).unwrap()
         );
-        restore_personal_root(old);
+        restore_protected_root(old);
     }
 
     #[test]
-    fn personal_root_env_is_refused() {
+    fn protected_root_env_is_refused() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("personal");
-        std::fs::create_dir_all(&personal).unwrap();
+        let protected = tmp.path().join("protected");
+        std::fs::create_dir_all(&protected).unwrap();
 
         let old = std::env::var("SHELVES_PROTECTED_ROOT").ok();
-        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
+        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
         let err =
-            canonical_allowed_path(&personal).expect_err("SHELVES_PROTECTED_ROOT must be refused");
+            canonical_allowed_path(&protected).expect_err("SHELVES_PROTECTED_ROOT must be refused");
         assert_eq!(
             violation_root(err),
-            std::fs::canonicalize(&personal).unwrap()
+            std::fs::canonicalize(&protected).unwrap()
         );
-        restore_personal_root(old);
+        restore_protected_root(old);
     }
 
     #[test]
     fn clean_path_passes() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("personal");
+        let protected = tmp.path().join("protected");
         let clean = tmp.path().join("clean");
-        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
         std::fs::create_dir_all(&clean).unwrap();
-        let _env = PersonalRootEnv::set(&personal);
+        let _env = ProtectedRootEnv::set(&protected);
         let allowed = canonical_allowed_path(&clean).unwrap();
         assert_eq!(allowed, std::fs::canonicalize(clean).unwrap());
     }
@@ -271,11 +273,11 @@ mod tests {
     fn missing_descendant_resolves_existing_prefix_and_lexical_components() {
         let _lock = env_lock().lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let personal = tmp.path().join("personal");
+        let protected = tmp.path().join("protected");
         let clean = tmp.path().join("clean");
-        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&protected).unwrap();
         std::fs::create_dir_all(&clean).unwrap();
-        let _env = PersonalRootEnv::set(&personal);
+        let _env = ProtectedRootEnv::set(&protected);
 
         let target = clean.join(".").join("nested").join("..").join("missing.md");
         let allowed = canonical_allowed_path(&target).unwrap();
@@ -285,72 +287,72 @@ mod tests {
 
     proptest! {
         #[test]
-        fn personal_root_descendants_are_refused(segments in vec(path_component(), 0..5)) {
+        fn protected_root_descendants_are_refused(segments in vec(path_component(), 0..5)) {
             let _lock = env_lock().lock().unwrap();
             let tmp = TempDir::new().unwrap();
-            let personal = tmp.path().join("private-root");
-            std::fs::create_dir_all(&personal).unwrap();
-            let _env = PersonalRootEnv::set(&personal);
-            let target = create_existing_descendant(&personal, &segments);
+            let protected = tmp.path().join("private-root");
+            std::fs::create_dir_all(&protected).unwrap();
+            let _env = ProtectedRootEnv::set(&protected);
+            let target = create_existing_descendant(&protected, &segments);
 
             let err = canonical_allowed_path(&target).expect_err("SHELVES_PROTECTED_ROOT descendant must be refused");
 
-            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&personal).unwrap());
+            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&protected).unwrap());
         }
 
         #[test]
-        fn traversal_into_personal_root_is_refused(segments in vec(path_component(), 0..5)) {
+        fn traversal_into_protected_root_is_refused(segments in vec(path_component(), 0..5)) {
             let _lock = env_lock().lock().unwrap();
             let tmp = TempDir::new().unwrap();
-            let personal = tmp.path().join("private-root");
+            let protected = tmp.path().join("private-root");
             let clean_nested = tmp.path().join("clean").join("nested");
-            std::fs::create_dir_all(&personal).unwrap();
+            std::fs::create_dir_all(&protected).unwrap();
             std::fs::create_dir_all(&clean_nested).unwrap();
-            let _env = PersonalRootEnv::set(&personal);
-            let target = create_existing_descendant(&personal, &segments);
-            let relative = target.strip_prefix(&personal).unwrap();
+            let _env = ProtectedRootEnv::set(&protected);
+            let target = create_existing_descendant(&protected, &segments);
+            let relative = target.strip_prefix(&protected).unwrap();
             let traversed = clean_nested.join("..").join("..").join("private-root").join(relative);
 
             let err = canonical_allowed_path(&traversed).expect_err(".. traversal into SHELVES_PROTECTED_ROOT must be refused");
 
-            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&personal).unwrap());
+            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&protected).unwrap());
         }
 
         #[test]
-        fn symlink_into_personal_root_is_refused_for_existing_descendants(
+        fn symlink_into_protected_root_is_refused_for_existing_descendants(
             segments in vec(path_component(), 0..5)
         ) {
             let _lock = env_lock().lock().unwrap();
             let tmp = TempDir::new().unwrap();
-            let personal = tmp.path().join("private-root");
+            let protected = tmp.path().join("private-root");
             let clean = tmp.path().join("clean");
-            std::fs::create_dir_all(&personal).unwrap();
+            std::fs::create_dir_all(&protected).unwrap();
             std::fs::create_dir_all(&clean).unwrap();
-            let _env = PersonalRootEnv::set(&personal);
-            let target = create_existing_descendant(&personal, &segments);
+            let _env = ProtectedRootEnv::set(&protected);
+            let target = create_existing_descendant(&protected, &segments);
             let link = clean.join("link");
-            std::os::unix::fs::symlink(&personal, &link).unwrap();
-            let relative = target.strip_prefix(&personal).unwrap();
+            std::os::unix::fs::symlink(&protected, &link).unwrap();
+            let relative = target.strip_prefix(&protected).unwrap();
             let through_link = link.join(relative);
 
             let err = canonical_allowed_path(&through_link).expect_err("symlink into SHELVES_PROTECTED_ROOT must be refused");
 
-            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&personal).unwrap());
+            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&protected).unwrap());
         }
 
         #[test]
-        fn symlink_into_personal_root_is_refused_for_missing_descendants(
+        fn symlink_into_protected_root_is_refused_for_missing_descendants(
             segments in vec(path_component(), 0..5)
         ) {
             let _lock = env_lock().lock().unwrap();
             let tmp = TempDir::new().unwrap();
-            let personal = tmp.path().join("private-root");
+            let protected = tmp.path().join("private-root");
             let clean = tmp.path().join("clean");
-            std::fs::create_dir_all(&personal).unwrap();
+            std::fs::create_dir_all(&protected).unwrap();
             std::fs::create_dir_all(&clean).unwrap();
-            let _env = PersonalRootEnv::set(&personal);
+            let _env = ProtectedRootEnv::set(&protected);
             let link = clean.join("link");
-            std::os::unix::fs::symlink(&personal, &link).unwrap();
+            std::os::unix::fs::symlink(&protected, &link).unwrap();
             let mut through_link = link.join("missing");
             for segment in &segments {
                 through_link.push(segment);
@@ -359,14 +361,14 @@ mod tests {
             let err = canonical_allowed_path(&through_link)
                 .expect_err("symlink prefix into SHELVES_PROTECTED_ROOT must be refused before read");
 
-            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&personal).unwrap());
+            prop_assert_eq!(violation_root(err), std::fs::canonicalize(&protected).unwrap());
         }
     }
 
     fn violation_root(err: GuardError) -> PathBuf {
         match err {
             GuardError::Violation(violation) => violation.protected_root,
-            GuardError::MissingPersonalRoot => panic!("expected guard violation"), // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+            GuardError::MissingProtectedRoot => panic!("expected guard violation"), // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
     }
 
@@ -393,11 +395,11 @@ mod tests {
         ]
     }
 
-    struct PersonalRootEnv {
+    struct ProtectedRootEnv {
         old: Option<String>,
     }
 
-    impl PersonalRootEnv {
+    impl ProtectedRootEnv {
         fn set(path: &Path) -> Self {
             let old = std::env::var("SHELVES_PROTECTED_ROOT").ok();
             unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", path) };
@@ -405,13 +407,13 @@ mod tests {
         }
     }
 
-    impl Drop for PersonalRootEnv {
+    impl Drop for ProtectedRootEnv {
         fn drop(&mut self) {
-            restore_personal_root(self.old.take());
+            restore_protected_root(self.old.take());
         }
     }
 
-    fn restore_personal_root(old: Option<String>) {
+    fn restore_protected_root(old: Option<String>) {
         match old {
             Some(value) => unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", value) }, // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
             None => unsafe { std::env::remove_var("SHELVES_PROTECTED_ROOT") },

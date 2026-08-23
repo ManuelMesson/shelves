@@ -1,4 +1,5 @@
 use std::io::{self, ErrorKind, Write};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -17,7 +18,7 @@ use crate::{
 #[command(
     name = "shelves",
     version,
-    about = "Shelves memory engine",
+    about = "Local-first Shelves memory engine",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -54,6 +55,8 @@ enum Commands {
     Brief(BriefArgs),
     /// Log a context or recall miss.
     Missed(MissedArgs),
+    /// Review logged recall misses.
+    Misses(MissesArgs),
     /// Assemble a per-decision context pack.
     Context(ContextArgs),
     /// Nominate promotion and cooling candidates.
@@ -66,8 +69,10 @@ enum Commands {
     Lock(LockArgs),
     /// Print table, scope, owner, status, and staleness counts.
     Stats(OutputArgs),
-    /// Refuse Layer-1 paths before any file walking.
+    /// Refuse protected paths before any file walking.
     GuardCheck(GuardCheckArgs),
+    /// Report or remove exact duplicate ingested-source episodes.
+    DedupeEpisodes(DedupeEpisodesArgs),
 }
 
 #[derive(Debug, Args)]
@@ -101,7 +106,7 @@ struct SearchArgs {
 struct AskArgs {
     agent: String,
     query: Vec<String>,
-    #[arg(long = "as", default_value = "agent:curator")]
+    #[arg(long = "as", default_value = "agent:coordinator")]
     as_agent: String,
     #[arg(long, default_value = "company")]
     scope: String,
@@ -124,7 +129,7 @@ struct RememberArgs {
     text: Vec<String>,
     #[arg(long)]
     due: String,
-    #[arg(long = "by", default_value = "agent:curator")]
+    #[arg(long = "by", default_value = "agent:coordinator")]
     by: String,
     #[arg(long)]
     json: bool,
@@ -166,8 +171,29 @@ struct ContextArgs {
 #[derive(Debug, Args)]
 struct MissedArgs {
     what: Vec<String>,
-    #[arg(long = "by", default_value = "agent:curator")]
+    #[arg(long = "by", default_value = "agent:coordinator")]
     by: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct MissesArgs {
+    #[command(subcommand)]
+    command: MissesCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum MissesCommands {
+    /// List logged misses, newest first.
+    List(MissesListArgs),
+}
+
+#[derive(Debug, Args)]
+struct MissesListArgs {
+    /// Include only misses logged in the last N days.
+    #[arg(long)]
+    since: Option<NonZeroU32>,
     #[arg(long)]
     json: bool,
 }
@@ -254,7 +280,7 @@ struct LockRenderArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum LockRenderTarget {
-    Curator,
+    Coordinator,
     Memory,
 }
 
@@ -278,6 +304,15 @@ struct OutputArgs {
 #[derive(Debug, Args)]
 struct GuardCheckArgs {
     path: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DedupeEpisodesArgs {
+    /// Apply deletion; without this flag the command is report-only.
+    #[arg(long)]
+    apply: bool,
     #[arg(long)]
     json: bool,
 }
@@ -472,6 +507,21 @@ fn run() -> Result<()> {
                 println!("[miss:{}] by {}\n  {}", row.id, row.by, row.what);
             }
         }
+        Some(Commands::Misses(args)) => match args.command {
+            MissesCommands::List(args) => {
+                let conn = storage::open_read_only(&db.path)?;
+                let rows = answer::misses(&conn, args.since.map(NonZeroU32::get))?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else if rows.is_empty() {
+                    println!("No logged misses.");
+                } else {
+                    for row in rows {
+                        println!("[miss:{}] {} by {}\n  {}", row.id, row.ts, row.by, row.what);
+                    }
+                }
+            }
+        },
         Some(Commands::Timeline(args)) => {
             let (from, to) = timeline_bounds(&args)?;
             print_timeline(&db, from, to, args.json)?;
@@ -524,6 +574,23 @@ fn run() -> Result<()> {
                 println!("allowed: {}", allowed.display());
             }
         }
+        Some(Commands::DedupeEpisodes(args)) => {
+            let mut conn = if args.apply {
+                storage::open_existing_read_write(&db.path)?
+            } else {
+                storage::open_read_only(&db.path)?
+            };
+            let report = storage::dedupe_ingested_episodes(&mut conn, args.apply)?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("before: {}", report.before);
+                println!("exact_duplicates: {}", report.exact_duplicates);
+                println!("removed: {}", report.removed);
+                println!("after: {}", report.after);
+                println!("applied: {}", report.applied);
+            }
+        }
         Some(Commands::PruneReport(args)) => {
             let conn = storage::open(&db.path)?;
             print_pack(answer::prune_report(&conn)?, args.json)?;
@@ -558,14 +625,14 @@ fn guard_check_output(path: &std::path::Path) -> GuardCheckOutput {
             protected_root: None,
             error: None,
         },
-        Err(guard::GuardError::MissingPersonalRoot) => GuardCheckOutput {
+        Err(guard::GuardError::MissingProtectedRoot) => GuardCheckOutput {
             allowed: false,
             status: "blocked".to_string(),
             checked_path: path.display().to_string(),
             resolved_path: None,
             protected_root: None,
             error: Some(
-                "SHELVES_PROTECTED_ROOT is required for Layer-1 protection; refusing file access"
+                "SHELVES_PROTECTED_ROOT is required for protected-path enforcement; refusing file access"
                     .to_string(),
             ),
         },
@@ -575,7 +642,7 @@ fn guard_check_output(path: &std::path::Path) -> GuardCheckOutput {
             checked_path: path.display().to_string(),
             resolved_path: Some(violation.path.display().to_string()),
             protected_root: Some(violation.protected_root.display().to_string()),
-            error: Some("Layer-1 path refused".to_string()),
+            error: Some("protected path refused".to_string()),
         },
     }
 }
@@ -707,7 +774,7 @@ fn run_lock(args: LockArgs, db: &DbPathResolution) -> Result<()> {
             } else {
                 if args.check {
                     bail!(
-                        "lock render --check requires --into <file> or --target <curator|memory>"
+                        "lock render --check requires --into <file> or --target <coordinator|memory>"
                     );
                 }
                 let out = args.out.unwrap_or(locks::default_render_path()?);
@@ -734,7 +801,7 @@ fn render_target_path(into: Option<PathBuf>, target: Option<LockRenderTarget>) -
         return Ok(path);
     }
     match target {
-        Some(LockRenderTarget::Curator) => Ok(workspace_root()?.join("CURATOR.md")),
+        Some(LockRenderTarget::Coordinator) => Ok(workspace_root()?.join("COORDINATOR.md")),
         Some(LockRenderTarget::Memory) => Ok(workspace_root()?.join("system/memory.md")),
         None => bail!("lock render target missing"),
     }
@@ -1018,6 +1085,7 @@ mod tests {
         "related",
         "brief",
         "missed",
+        "misses",
         "context",
         "consolidate",
         "promote",
@@ -1073,8 +1141,8 @@ mod tests {
             PathBuf::from("/tmp/explicit.md")
         );
         assert_eq!(
-            render_target_path(None, Some(LockRenderTarget::Curator)).unwrap(),
-            PathBuf::from("/tmp/shelves-root/CURATOR.md")
+            render_target_path(None, Some(LockRenderTarget::Coordinator)).unwrap(),
+            PathBuf::from("/tmp/shelves-root/COORDINATOR.md")
         );
         assert_eq!(
             render_target_path(None, Some(LockRenderTarget::Memory)).unwrap(),
@@ -1176,11 +1244,11 @@ mod tests {
     #[test]
     fn guard_check_json_output_reports_verified_and_blocked_states() {
         let _lock = env_lock().lock().unwrap();
-        let old_personal_root = std::env::var("SHELVES_PROTECTED_ROOT").ok();
+        let old_protected_root = std::env::var("SHELVES_PROTECTED_ROOT").ok();
         let temp = tempfile::tempdir().unwrap();
-        let personal = temp.path().join("private-root");
-        std::fs::create_dir(&personal).unwrap();
-        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
+        let protected = temp.path().join("protected-os");
+        std::fs::create_dir(&protected).unwrap();
+        unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
 
         let allowed = guard_check_output(PathBuf::from("/tmp").as_path());
         assert!(allowed.allowed);
@@ -1188,15 +1256,15 @@ mod tests {
         assert!(allowed.resolved_path.is_some());
         assert!(allowed.error.is_none());
 
-        let blocked = guard_check_output(personal.join("finance.md").as_path());
+        let blocked = guard_check_output(protected.join("secret.md").as_path());
         assert!(!blocked.allowed);
         assert_eq!(blocked.status, "blocked");
-        let expected_root = personal.display().to_string();
+        let expected_root = protected.display().to_string();
         assert_eq!(
             blocked.protected_root.as_deref(),
             Some(expected_root.as_str())
         );
-        assert_eq!(blocked.error.as_deref(), Some("Layer-1 path refused"));
+        assert_eq!(blocked.error.as_deref(), Some("protected path refused"));
 
         unsafe { std::env::remove_var("SHELVES_PROTECTED_ROOT") };
         let missing = guard_check_output(PathBuf::from("/tmp").as_path());
@@ -1210,7 +1278,7 @@ mod tests {
                 .contains("SHELVES_PROTECTED_ROOT is required")
         );
 
-        restore_env("SHELVES_PROTECTED_ROOT", old_personal_root);
+        restore_env("SHELVES_PROTECTED_ROOT", old_protected_root);
     }
 
     struct FailingWriter {
@@ -1258,13 +1326,23 @@ mod tests {
             } else if *verb == "related" {
                 vec!["shelves", verb, "test"]
             } else if *verb == "brief" {
-                vec!["shelves", verb, "curator"]
+                vec!["shelves", verb, "coordinator"]
             } else if *verb == "missed" {
                 vec!["shelves", verb, "test"]
+            } else if *verb == "misses" {
+                vec!["shelves", verb, "list"]
             } else if *verb == "context" {
-                vec!["shelves", verb, "curator", "test"]
+                vec!["shelves", verb, "coordinator", "test"]
             } else if *verb == "promote" {
-                vec!["shelves", verb, "1", "--to", "company", "--by", "curator"]
+                vec![
+                    "shelves",
+                    verb,
+                    "1",
+                    "--to",
+                    "company",
+                    "--by",
+                    "coordinator",
+                ]
             } else if *verb == "lock" {
                 vec!["shelves", verb, "render"]
             } else {

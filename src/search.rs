@@ -4,8 +4,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::acl;
-use crate::storage;
+use crate::{acl, locale, storage};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
@@ -47,6 +46,27 @@ pub fn search(
     include_cold: bool,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
+    let query = locale::prepare(query)?;
+    search_prepared(
+        conn,
+        &query.search_text,
+        scope,
+        owner,
+        as_agent,
+        include_cold,
+        limit,
+    )
+}
+
+fn search_prepared(
+    conn: &Connection,
+    query: &str,
+    scope: &str,
+    owner: Option<&str>,
+    as_agent: &str,
+    include_cold: bool,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
     let fts_queries = fts_queries(query);
     if fts_queries.is_empty() {
         return Ok(Vec::new());
@@ -57,6 +77,13 @@ pub fn search(
     for fts_query in fts_queries {
         let mut query_hits = Vec::new();
         for (scope_index, search_scope) in scopes.iter().enumerate() {
+            query_hits.extend(search_locks(
+                conn,
+                &fts_query.expression,
+                search_scope,
+                scope_index,
+                limit,
+            )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
             query_hits.extend(search_memories(
                 conn,
                 &fts_query.expression,
@@ -185,7 +212,7 @@ pub fn lock_relevance_scores(
     for ranked in ranked_hits {
         let score = -ranked.hit.rank;
         scores
-            .entry(ranked.hit.id)
+            .entry(-ranked.hit.id)
             .and_modify(|existing: &mut f64| *existing = existing.max(score))
             .or_insert(score);
     }
@@ -213,6 +240,9 @@ fn search_locks(
     scope_index: usize,
     limit: usize,
 ) -> Result<Vec<RawSearchHit>> {
+    let source_path = crate::workspace_root()
+        .map(|root| root.join("system/locks.yaml").to_string_lossy().to_string())
+        .unwrap_or_else(|_| "system/locks.yaml".to_string());
     let mut stmt = conn.prepare(
         "SELECT l.id, l.slug, l.title, substr(l.body, 1, 300), l.scope, bm25(locks_fts, 5.0, 1.0, 1.0) AS rank, l.body
          FROM locks_fts
@@ -236,8 +266,8 @@ fn search_locks(
                 scope_index,
                 search_text: format!("{slug}\n{title}\n{body}"),
                 hit: SearchHit {
-                    kind: "memory".to_string(),
-                    id: -id,
+                    kind: "lock".to_string(),
+                    id,
                     name: slug,
                     title,
                     snippet: row.get(3)?,
@@ -245,7 +275,7 @@ fn search_locks(
                     scope: row.get(4)?,
                     is_lock: 1,
                     status: "active".to_string(),
-                    source_path: String::new(),
+                    source_path: source_path.clone(),
                     rank: raw_rank,
                 },
             })
@@ -443,14 +473,15 @@ fn real_match_stats(search_text: &str, terms: &[String]) -> (usize, f64) {
 
 fn rank_hits(raw_hits: Vec<RawSearchHit>, episode_weight: f64) -> Vec<RawSearchHit> {
     let max_memory_score = max_abs_rank(&raw_hits, "memory");
+    let max_lock_score = max_abs_rank(&raw_hits, "lock");
     let max_episode_score = max_abs_rank(&raw_hits, "episode");
     raw_hits
         .into_iter()
         .map(|mut raw| {
-            let max_for_kind = if raw.hit.kind == "episode" {
-                max_episode_score
-            } else {
-                max_memory_score
+            let max_for_kind = match raw.hit.kind.as_str() {
+                "lock" => max_lock_score,
+                "episode" => max_episode_score,
+                _ => max_memory_score,
             };
             let normalized = if max_for_kind > 0.0 {
                 raw.raw_rank.abs() / max_for_kind
@@ -477,7 +508,11 @@ fn max_abs_rank(raw_hits: &[RawSearchHit], kind: &str) -> f64 {
 }
 
 fn kind_order(kind: &str) -> u8 {
-    if kind == "memory" { 0 } else { 1 }
+    match kind {
+        "memory" => 0,
+        "lock" => 1,
+        _ => 2,
+    }
 }
 
 fn fts_queries(query: &str) -> Vec<FtsQuery> {
@@ -551,8 +586,8 @@ mod tests {
     #[test]
     fn scope_fallthrough_orders_nearest_first() {
         assert_eq!(
-            scope_fallthrough("product:notebook"),
-            ["product:notebook", "company", "os"]
+            scope_fallthrough("product:catalog"),
+            ["product:catalog", "company", "os"]
         );
         assert_eq!(scope_fallthrough("company"), ["company", "product:%", "os"]);
         assert_eq!(scope_fallthrough("ops"), ["os", "company"]);
@@ -563,9 +598,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         let doc = MemoryDoc {
-            name: "barista".to_string(),
-            title: "Barista thesis".to_string(),
-            body: "A great barista knows your name and walks you through.".to_string(),
+            name: "guide".to_string(),
+            title: "Guide thesis".to_string(),
+            body: "A great guide knows your name and walks you through.".to_string(),
             owner: "shared".to_string(),
             scope: "company".to_string(),
             source_path: Path::new("/tmp/memory.md").to_path_buf(),
@@ -578,7 +613,7 @@ mod tests {
         storage::rebuild_fts(&conn).unwrap();
         let hits = search(
             &conn,
-            "barista thesis",
+            "guide thesis",
             "company",
             None,
             "agent:engineer",
@@ -591,6 +626,45 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM recall_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn search_surfaces_active_lock_as_a_distinct_head_hit() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO locks(slug, title, body, scope, locked_on, status)
+             VALUES('clean-gate', 'Clean Gate Rule',
+                    'A clean gate says they will let you in; it does not say you want to be inside.',
+                    'company', '2026-07-31', 'active')",
+            [],
+        )
+        .unwrap();
+        insert_memory(
+            &conn,
+            "gate-noise",
+            "Gate Notes",
+            "A generic gate note about being inside a building.",
+            "company",
+        );
+        storage::rebuild_fts(&conn).unwrap();
+        storage::rebuild_locks_fts(&conn).unwrap();
+
+        let hits = search(
+            &conn,
+            "a clean gate says they will let you in",
+            "company",
+            None,
+            "agent:engineer",
+            false,
+            3,
+        )
+        .unwrap();
+
+        let lock = hits.iter().find(|hit| hit.kind == "lock").unwrap();
+        assert_eq!(lock.id, 1);
+        assert_eq!(lock.name, "clean-gate");
+        assert!(hits.iter().position(|hit| hit.kind == "lock").unwrap() < 3);
     }
 
     #[test]
@@ -694,10 +768,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            expressions("builder dispatch pattern"),
+            expressions("worker dispatch pattern"),
             [
-                "builder* dispatch* pattern*",
-                "builder* OR dispatch* OR pattern*"
+                "worker* dispatch* pattern*",
+                "worker* OR dispatch* OR pattern*"
             ]
         );
         assert_eq!(expressions("builder"), ["builder*"]);
@@ -804,17 +878,24 @@ mod tests {
 
     #[test]
     fn rank_hits_normalizes_per_kind_and_weights_episodes() {
+        assert_eq!(kind_order("memory"), 0);
+        assert_eq!(kind_order("lock"), 1);
+        assert_eq!(kind_order("episode"), 2);
+
         let hits = rank_hits(
             vec![
                 raw_hit("memory", 1, -1.0, 0),
+                raw_hit("lock", 3, -100.0, 0),
                 raw_hit("episode", 2, -100.0, 0),
             ],
             0.55,
         );
 
         let memory = hits.iter().find(|hit| hit.hit.kind == "memory").unwrap();
+        let lock = hits.iter().find(|hit| hit.hit.kind == "lock").unwrap();
         let episode = hits.iter().find(|hit| hit.hit.kind == "episode").unwrap();
         assert!(memory.hit.rank < episode.hit.rank);
+        assert_eq!(lock.hit.rank, -1.0);
         assert_eq!(episode.hit.rank, -0.55);
     }
 
@@ -825,7 +906,7 @@ mod tests {
         insert_memory(
             &conn,
             "builder-dispatch-pattern",
-            "Builder dispatch pattern",
+            "Worker dispatch pattern",
             "Absolute workspace tickets and scripted handoff are the canonical dispatch pattern.",
             "os",
         );
@@ -833,9 +914,9 @@ mod tests {
             ts: "2026-06-10T00:00:00Z".to_string(),
             actor: "agent:builder".to_string(),
             kind: "ticket".to_string(),
-            summary: "builder dispatch pattern builder dispatch pattern builder dispatch pattern"
+            summary: "worker dispatch pattern worker dispatch pattern worker dispatch pattern"
                 .to_string(),
-            body: "builder dispatch pattern builder dispatch pattern builder dispatch pattern"
+            body: "worker dispatch pattern worker dispatch pattern worker dispatch pattern"
                 .to_string(),
             scope: "os".to_string(),
             source_path: Path::new("/tmp/noise.md").to_path_buf(),
@@ -845,7 +926,7 @@ mod tests {
 
         let hits = search(
             &conn,
-            "builder dispatch pattern",
+            "worker dispatch pattern",
             "os",
             None,
             "agent:engineer",
@@ -855,7 +936,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(hits[0].kind, "memory");
-        assert_eq!(hits[0].title, "Builder dispatch pattern");
+        assert_eq!(hits[0].title, "Worker dispatch pattern");
     }
 
     #[test]
@@ -929,14 +1010,14 @@ mod tests {
             &conn,
             "company-pattern",
             "Shared dispatch pattern",
-            "builder dispatch pattern",
+            "worker dispatch pattern",
             "company",
         );
         insert_memory(
             &conn,
             "os-pattern",
             "Shared dispatch pattern",
-            "builder dispatch pattern",
+            "worker dispatch pattern",
             "os",
         );
         storage::rebuild_fts(&conn).unwrap();

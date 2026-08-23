@@ -59,4 +59,52 @@ mod tests {
         assert!(can_read_owner(&conn, "shared", "agent:engineer").unwrap());
         assert!(can_read_owner(&conn, "agent:engineer", "agent:engineer").unwrap());
     }
+
+    #[test]
+    fn explicit_reader_rows_override_wildcard_for_grants_and_revokes() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO node_acl(owner_node, reader, granted) VALUES('agent:archivist', '*', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_acl(owner_node, reader, granted) VALUES('agent:archivist', 'agent:reviewer', 1)",
+            [],
+        )
+        .unwrap();
+
+        assert!(can_read_owner(&conn, "agent:archivist", "agent:reviewer").unwrap());
+        assert!(!can_read_owner(&conn, "agent:archivist", "agent:visitor").unwrap());
+
+        conn.execute(
+            "UPDATE node_acl SET granted = 1 WHERE owner_node = 'agent:archivist' AND reader = '*'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE node_acl SET granted = 0 WHERE owner_node = 'agent:archivist' AND reader = 'agent:reviewer'",
+            [],
+        )
+        .unwrap();
+
+        assert!(!can_read_owner(&conn, "agent:archivist", "agent:reviewer").unwrap());
+        assert!(can_read_owner(&conn, "agent:archivist", "agent:visitor").unwrap());
+    }
+
+    #[test]
+    fn caller_identity_is_an_unverified_string_and_default_open() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        assert!(
+            can_read_owner(
+                &conn,
+                "agent:archivist",
+                "agent:caller-supplied-without-authentication"
+            )
+            .unwrap()
+        );
+    }
 }

@@ -316,14 +316,14 @@ struct SectionReplacement {
 
 fn replace_generated_section(original: &str, generated: &str) -> Result<SectionReplacement> {
     let Some(begin_start) = original.find(GENERATED_LOCKS_BEGIN) else {
-        bail!("target has no generated-lock markers; placement is the A5 flip, Operator-gated");
+        bail!("target has no generated-lock markers; placement is the A5 flip, Maintainer-gated");
     };
     let begin_end = begin_start + GENERATED_LOCKS_BEGIN.len();
     if original[begin_end..].contains(GENERATED_LOCKS_BEGIN) {
         bail!("target has multiple generated-lock begin markers; refusing ambiguous render");
     }
     let Some(end_relative) = original[begin_end..].find(GENERATED_LOCKS_END) else {
-        bail!("target has no generated-lock markers; placement is the A5 flip, Operator-gated");
+        bail!("target has no generated-lock markers; placement is the A5 flip, Maintainer-gated");
     };
     let end_start = begin_end + end_relative;
     let end_end = end_start + GENERATED_LOCKS_END.len();
@@ -457,7 +457,7 @@ fn validate_candidates(proposals: &[LockEntry], existing: &[LockEntry]) -> Vec<C
                     // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
                     slug,
                     verdict: "duplicate-slug".to_string(),
-                    message: "slug already exists with the frontende body; skipping".to_string(),
+                    message: "slug already exists with the same body; skipping".to_string(),
                 }
             } else {
                 ImportVerdict {
@@ -498,7 +498,7 @@ fn validate_candidates(proposals: &[LockEntry], existing: &[LockEntry]) -> Vec<C
                 | "bad-body"
                 | "missing-supersede-target"
         ) || (verdict.verdict == "duplicate-slug"
-            && !verdict.message.contains("frontende body"));
+            && !verdict.message.contains("same body"));
         candidates.push(Candidate {
             entry: entry.clone(),
             accepted,
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn import_validator_reports_verdict_matrix() {
-        let existing = vec![entry("existing-lock", "frontende body")];
+        let existing = vec![entry("existing-lock", "same body")];
         let mut superseding = entry("superseding-lock", "new body");
         superseding.supersedes = Some("existing-lock".to_string());
         let mut bad_slug = entry("BadSlug", "body");
@@ -739,7 +739,7 @@ mod tests {
         let mut bad_title = entry("bad-title-lock", "body");
         bad_title.title = " ".to_string();
         let mut bad_scope = entry("bad-scope-lock", "body");
-        bad_scope.scope = "personal".to_string();
+        bad_scope.scope = "protected".to_string();
         let mut bad_date = entry("bad-date-lock", "body");
         bad_date.locked_on = "06/11/2026".to_string();
         let mut bad_supersedes_slug = entry("bad-supersedes-lock", "body");
@@ -749,7 +749,7 @@ mod tests {
         missing.supersedes = Some("missing-lock".to_string());
         let proposals = vec![
             entry("new-lock", "body"),
-            entry("existing-lock", "frontende body"),
+            entry("existing-lock", "same body"),
             entry("existing-lock", "changed body"),
             bad_slug,
             bad_title,
@@ -895,7 +895,7 @@ mod tests {
         let proposals = NamedTempFile::new().unwrap();
         std::fs::write(
             proposals.path(),
-            "- slug: bad\n  title: Bad\n  scope: personal\n  locked_on: 2026-06-11\n  body: nope\n",
+            "- slug: bad\n  title: Bad\n  scope: protected\n  locked_on: 2026-06-11\n  body: nope\n",
         )
         .unwrap();
         let before = std::fs::read_to_string(store.path()).unwrap();
@@ -1204,24 +1204,24 @@ mod tests {
         _lock: MutexGuard<'static, ()>,
         _tmp: TempDir,
         old_root: Option<String>,
-        old_personal: Option<String>,
+        old_protected: Option<String>,
     }
 
     impl TestEnv {
         fn set() -> Self {
             let lock = env_lock().lock().unwrap();
             let tmp = TempDir::new().unwrap();
-            let personal = tmp.path().join("private-root");
-            std::fs::create_dir_all(&personal).unwrap();
+            let protected = tmp.path().join("protected-os");
+            std::fs::create_dir_all(&protected).unwrap();
             let old_root = std::env::var("AIOS_ROOT").ok();
-            let old_personal = std::env::var("SHELVES_PROTECTED_ROOT").ok();
+            let old_protected = std::env::var("SHELVES_PROTECTED_ROOT").ok();
             unsafe { std::env::set_var("AIOS_ROOT", tmp.path()) };
-            unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &personal) };
+            unsafe { std::env::set_var("SHELVES_PROTECTED_ROOT", &protected) };
             Self {
                 _lock: lock,
                 _tmp: tmp,
                 old_root,
-                old_personal,
+                old_protected,
             }
         }
     }
@@ -1229,7 +1229,7 @@ mod tests {
     impl Drop for TestEnv {
         fn drop(&mut self) {
             restore_env("AIOS_ROOT", self.old_root.take());
-            restore_env("SHELVES_PROTECTED_ROOT", self.old_personal.take());
+            restore_env("SHELVES_PROTECTED_ROOT", self.old_protected.take());
         }
     }
 
@@ -1333,7 +1333,7 @@ mod tests {
             "\\PC{0,256}",
             "[a-z0-9-]{0,64}",
             Just("company".to_string()),
-            Just("product:notebook".to_string()),
+            Just("product:catalog".to_string()),
             Just("2026-06-13".to_string()),
             Just("not-a-date".to_string()),
             Just("café".to_string()),

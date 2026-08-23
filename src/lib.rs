@@ -7,6 +7,7 @@ pub mod cli;
 pub mod graduation;
 pub mod guard;
 pub mod ingest;
+pub mod locale;
 pub mod locks;
 pub mod parser;
 pub mod schema;

@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
@@ -28,12 +29,93 @@ pub struct Stats {
     pub stale: bool,
 }
 
+const INGESTED_EPISODE_KINDS_SQL: &str =
+    "'handoff', 'archivist-report', 'agent-to-agent', 'ticket', 'team-log', 'meeting'";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EpisodeIdentity {
+    source_path: Option<String>,
+    summary: String,
+    body: Option<String>,
+}
+
+impl EpisodeIdentity {
+    fn from_doc(doc: &EpisodeDoc) -> Self {
+        Self {
+            source_path: Some(doc.source_path.to_string_lossy().into_owned()),
+            summary: doc.summary.clone(),
+            body: Some(doc.body.clone()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct EpisodeDeduper {
+    identities: HashSet<EpisodeIdentity>,
+}
+
+impl EpisodeDeduper {
+    pub fn load(conn: &Connection) -> Result<Self> {
+        let sql = format!(
+            "SELECT source_path, summary, body
+             FROM episodes
+             WHERE kind IN ({INGESTED_EPISODE_KINDS_SQL})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EpisodeIdentity {
+                source_path: row.get(0)?,
+                summary: row.get(1)?,
+                body: row.get(2)?,
+            })
+        })?;
+        let identities = rows.collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(Self { identities })
+    }
+
+    pub fn insert_if_new(&mut self, conn: &Connection, doc: &EpisodeDoc) -> Result<Option<i64>> {
+        if !is_ingested_episode_kind(&doc.kind) {
+            bail!("episode kind {:?} is not an ingested-source kind", doc.kind);
+        }
+        let identity = EpisodeIdentity::from_doc(doc);
+        if self.identities.contains(&identity) {
+            return Ok(None);
+        }
+        conn.execute(
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                doc.ts,
+                doc.actor,
+                doc.kind,
+                doc.summary,
+                doc.body,
+                doc.scope,
+                doc.source_path.to_string_lossy()
+            ],
+        )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+        let id = conn.last_insert_rowid();
+        self.identities.insert(identity);
+        Ok(Some(id))
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EpisodeDedupeReport {
+    pub applied: bool,
+    pub before: i64,
+    pub exact_duplicates: i64,
+    pub removed: i64,
+    pub after: i64,
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating db parent {}", parent.display()))?;
     } // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
     schema::init_db(&conn)?;
     Ok(conn)
 }
@@ -43,16 +125,28 @@ pub fn open_read_only(path: &Path) -> Result<Connection> {
         .with_context(|| format!("opening {} read-only", path.display()))
 }
 
+pub fn open_existing_read_write(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .with_context(|| format!("opening existing database {}", path.display()))?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    Ok(conn)
+}
+
 pub fn rebuild_fts(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT INTO memories_fts(memories_fts) VALUES('rebuild')",
         [],
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    rebuild_episodes_fts(conn)?;
+    rebuild_locks_fts(conn)?;
+    Ok(())
+}
+
+pub fn rebuild_episodes_fts(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT INTO episodes_fts(episodes_fts) VALUES('rebuild')",
         [],
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    rebuild_locks_fts(conn)?;
     Ok(())
 }
 
@@ -148,21 +242,86 @@ pub fn archive_absent_memories_for_source(
     Ok(stale_ids.len())
 }
 
-pub fn insert_episode_if_new(conn: &Connection, doc: &EpisodeDoc) -> Result<i64> {
-    conn.execute(
-        "INSERT OR IGNORE INTO episodes(ts, actor, kind, summary, body, scope, source_path)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            doc.ts,
-            doc.actor,
-            doc.kind,
-            doc.summary,
-            doc.body,
-            doc.scope,
-            doc.source_path.to_string_lossy()
-        ],
-    )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    Ok(conn.last_insert_rowid())
+pub fn insert_episode_if_new(conn: &Connection, doc: &EpisodeDoc) -> Result<Option<i64>> {
+    drop_legacy_episode_idempotency_index(conn)?;
+    EpisodeDeduper::load(conn)?.insert_if_new(conn, doc)
+}
+
+pub fn drop_legacy_episode_idempotency_index(conn: &Connection) -> Result<()> {
+    conn.execute("DROP INDEX IF EXISTS episodes_idempotency", [])?;
+    Ok(())
+}
+
+pub fn dedupe_ingested_episodes(conn: &mut Connection, apply: bool) -> Result<EpisodeDedupeReport> {
+    let before = scalar_count(conn, "SELECT COUNT(*) FROM episodes")?;
+    let exact_duplicates = exact_ingested_episode_duplicates(conn)?;
+    if !apply {
+        return Ok(EpisodeDedupeReport {
+            applied: false,
+            before,
+            exact_duplicates,
+            removed: 0,
+            after: before,
+        });
+    }
+
+    let tx = conn.transaction()?;
+    drop_legacy_episode_idempotency_index(&tx)?;
+    let sql = format!(
+        "WITH ranked AS (
+           SELECT id,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY source_path, summary, body
+                    ORDER BY COALESCE(julianday(ts), 5373484.5) ASC, ts ASC, id ASC
+                  ) AS duplicate_rank
+           FROM episodes
+           WHERE kind IN ({INGESTED_EPISODE_KINDS_SQL})
+         )
+         DELETE FROM episodes
+         WHERE id IN (
+           SELECT id FROM ranked WHERE duplicate_rank > 1
+         )"
+    );
+    let removed = tx.execute(&sql, [])? as i64;
+    rebuild_episodes_fts(&tx)?;
+    let after = scalar_count(&tx, "SELECT COUNT(*) FROM episodes")?;
+    if removed != exact_duplicates || before - after != exact_duplicates {
+        // LCOV_EXCL_START: defensive invariant; SQLite reports both counts inside one transaction.
+        bail!(
+            "episode cleanup count mismatch: expected {exact_duplicates}, removed {removed}, before {before}, after {after}"
+        );
+        // LCOV_EXCL_STOP
+    }
+    tx.commit()?;
+
+    Ok(EpisodeDedupeReport {
+        applied: true,
+        before,
+        exact_duplicates,
+        removed,
+        after,
+    })
+}
+
+fn exact_ingested_episode_duplicates(conn: &Connection) -> Result<i64> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(row_count - 1), 0)
+         FROM (
+           SELECT COUNT(*) AS row_count
+           FROM episodes
+           WHERE kind IN ({INGESTED_EPISODE_KINDS_SQL})
+           GROUP BY source_path, summary, body
+           HAVING COUNT(*) > 1
+         )"
+    );
+    scalar_count(conn, &sql)
+}
+
+fn is_ingested_episode_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "handoff" | "archivist-report" | "agent-to-agent" | "ticket" | "team-log" | "meeting"
+    )
 }
 
 pub fn log_recall_event(
@@ -378,6 +537,7 @@ fn staleness(last_ingest_ts: &Option<String>, source_files: &[PathBuf]) -> bool 
 mod tests {
     use super::*;
     use crate::parser::{EpisodeDoc, MemoryDoc};
+    use proptest::prelude::*;
     use rusqlite::Connection;
     use std::path::Path;
     use tempfile::NamedTempFile;
@@ -416,17 +576,165 @@ mod tests {
     }
 
     #[test]
+    fn episode_deduper_uses_content_identity_and_rejects_runtime_kinds() {
+        let conn = test_conn();
+        let first = episode_doc("ticket", "Stable summary", "Stable body");
+        let first_id = insert_episode_if_new(&conn, &first).unwrap().unwrap();
+        conn.execute(
+            "CREATE UNIQUE INDEX episodes_idempotency
+             ON episodes(ts, actor, kind, summary, source_path)",
+            [],
+        )
+        .unwrap();
+
+        let mut metadata_drift = first.clone();
+        metadata_drift.ts = "2026-06-11T12:30:00Z".to_string();
+        metadata_drift.actor = "agent:archivist".to_string();
+        metadata_drift.scope = "os".to_string();
+        assert_eq!(insert_episode_if_new(&conn, &metadata_drift).unwrap(), None);
+        assert_eq!(
+            sqlite_object_count(&conn, "index", "episodes_idempotency"),
+            0
+        );
+
+        let mut changed = first.clone();
+        changed.body = "Changed body".to_string();
+        let changed_id = insert_episode_if_new(&conn, &changed).unwrap().unwrap();
+        assert!(changed_id > first_id);
+
+        let miss = episode_doc("miss", "Stable summary", "Stable body");
+        let err = insert_episode_if_new(&conn, &miss).unwrap_err();
+        assert!(err.to_string().contains("not an ingested-source kind"));
+    }
+
+    #[test]
+    fn episode_cleanup_reports_then_removes_only_ingest_duplicates() {
+        let mut conn = test_conn();
+        conn.execute_batch(
+            "INSERT INTO memories(name, title, body, owner, scope, source_path, content_hash, created_at, updated_at)
+             VALUES('untouched', 'Untouched', 'memory body', 'shared', 'company', '/tmp/m.md', 'hash', '2026-06-01', '2026-06-01');
+             INSERT INTO locks(slug, title, body, scope, locked_on, status)
+             VALUES('untouched-lock', 'Untouched Lock', 'lock body', 'company', '2026-06-01', 'active');
+             INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES
+               ('2026-06-02T00:00:00Z', 'agent:engineer', 'ticket', 'duplicate', 'same', 'company', '/tmp/ticket.md'),
+               ('2026-06-01T00:00:00Z', 'agent:archivist', 'handoff', 'duplicate', 'same', 'os', '/tmp/ticket.md'),
+               ('2026-06-01T00:00:00Z', 'agent:engineer', 'miss', 'runtime', 'runtime', 'company', ''),
+               ('2026-06-02T00:00:00Z', 'agent:engineer', 'miss', 'runtime', 'runtime', 'company', ''),
+               ('2026-06-01T00:00:00Z', 'agent:engineer', 'promotion', 'audit', 'audit', 'company', ''),
+               ('2026-06-02T00:00:00Z', 'agent:engineer', 'promotion', 'audit', 'audit', 'company', '');
+             CREATE UNIQUE INDEX episodes_idempotency
+             ON episodes(ts, actor, kind, summary, source_path);",
+        )
+        .unwrap();
+        rebuild_fts(&conn).unwrap();
+
+        let preview = dedupe_ingested_episodes(&mut conn, false).unwrap();
+        assert!(!preview.applied);
+        assert_eq!(preview.before, 6);
+        assert_eq!(preview.exact_duplicates, 1);
+        assert_eq!(preview.removed, 0);
+        assert_eq!(preview.after, 6);
+        assert_eq!(
+            sqlite_object_count(&conn, "index", "episodes_idempotency"),
+            1
+        );
+
+        let applied = dedupe_ingested_episodes(&mut conn, true).unwrap();
+        assert!(applied.applied);
+        assert_eq!(applied.before, 6);
+        assert_eq!(applied.exact_duplicates, 1);
+        assert_eq!(applied.removed, 1);
+        assert_eq!(applied.after, 5);
+        assert_eq!(
+            sqlite_object_count(&conn, "index", "episodes_idempotency"),
+            0
+        );
+
+        let retained: (String, String) = conn
+            .query_row(
+                "SELECT ts, kind FROM episodes
+                 WHERE source_path='/tmp/ticket.md' AND summary='duplicate'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            ("2026-06-01T00:00:00Z".to_string(), "handoff".to_string())
+        );
+        assert_eq!(episode_kind_count(&conn, "miss"), 2);
+        assert_eq!(episode_kind_count(&conn, "promotion"), 2);
+        assert_eq!(sqlite_object_count(&conn, "table", "memories"), 1);
+        assert_eq!(sqlite_object_count(&conn, "table", "locks"), 1);
+        let fts_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM episodes_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 5);
+    }
+
+    #[test]
+    fn open_existing_read_write_requires_an_existing_database() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("missing.db");
+        let err = open_existing_read_write(&missing).unwrap_err();
+        assert!(err.to_string().contains("opening existing database"));
+
+        let existing = tmp.path().join("existing.db");
+        Connection::open(&existing).unwrap();
+        assert!(open_existing_read_write(&existing).is_ok());
+    }
+
+    fn sqlite_object_count(conn: &Connection, object_type: &str, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+            params![object_type, name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn episode_kind_count(conn: &Connection, kind: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM episodes WHERE kind=?1",
+            params![kind],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    proptest! {
+        #[test]
+        fn episode_identity_ignores_ingest_metadata_drift(
+            ts in "\\PC*",
+            actor in "\\PC*",
+            scope in "\\PC*",
+        ) {
+            let original = episode_doc("ticket", "Stable summary", "Stable body");
+            let mut drifted = original.clone();
+            drifted.ts = ts;
+            drifted.actor = actor;
+            drifted.scope = scope;
+
+            prop_assert_eq!(
+                EpisodeIdentity::from_doc(&original),
+                EpisodeIdentity::from_doc(&drifted)
+            );
+        }
+    }
+
+    #[test]
     fn upsert_memory_is_idempotent_until_content_hash_drifts() {
         let conn = test_conn();
-        let doc = memory_doc("barista", "Barista", "Original body");
+        let doc = memory_doc("guide", "Guide", "Original body");
 
         let id = upsert_memory(&conn, &doc).unwrap();
-        let frontende_id = upsert_memory(&conn, &doc).unwrap();
+        let same_id = upsert_memory(&conn, &doc).unwrap();
 
-        assert_eq!(frontende_id, id);
+        assert_eq!(same_id, id);
         let (count, updated_at): (i64, String) = conn
             .query_row(
-                "SELECT COUNT(*), max(updated_at) FROM memories WHERE name = 'barista'",
+                "SELECT COUNT(*), max(updated_at) FROM memories WHERE name = 'guide'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -435,7 +743,7 @@ mod tests {
         assert_eq!(updated_at, "2026-06-01T00:00:00Z");
 
         let mut mutated = doc.clone();
-        mutated.title = "Barista updated".to_string();
+        mutated.title = "Guide updated".to_string();
         mutated.body = "Mutated body".to_string();
         mutated.owner = "agent:engineer".to_string();
         mutated.scope = "os".to_string();
@@ -465,7 +773,7 @@ mod tests {
         assert_eq!(
             row,
             (
-                "Barista updated".to_string(),
+                "Guide updated".to_string(),
                 "Mutated body".to_string(),
                 "agent:engineer".to_string(),
                 "os".to_string(),
@@ -520,7 +828,7 @@ mod tests {
         let conn = test_conn();
         upsert_memory(
             &conn,
-            &memory_doc("memory-fts", "Barista Memory", "walks every guest through"),
+            &memory_doc("memory-fts", "Guide Memory", "walks every guest through"),
         )
         .unwrap();
         insert_episode_if_new(
@@ -539,7 +847,7 @@ mod tests {
 
         let memory_hits: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'barista'",
+                "SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH 'guide'",
                 [],
                 |row| row.get(0),
             )
@@ -733,7 +1041,7 @@ mod tests {
         upsert_memory(&conn, &lock_doc).unwrap();
         let mut archived_doc = memory_doc("archived", "Archived", "body");
         archived_doc.owner = "agent:engineer".to_string();
-        archived_doc.scope = "product:notebook".to_string();
+        archived_doc.scope = "product:catalog".to_string();
         let archived_id = upsert_memory(&conn, &archived_doc).unwrap();
         conn.execute(
             "UPDATE memories SET status = 'archived' WHERE id = ?1",
@@ -779,7 +1087,7 @@ mod tests {
         assert_eq!(stale_stats.cold_memories, 1);
         assert_eq!(stale_stats.memories_by_scope["company"], 2);
         assert_eq!(stale_stats.memories_by_scope["os"], 1);
-        assert_eq!(stale_stats.memories_by_scope["product:notebook"], 1);
+        assert_eq!(stale_stats.memories_by_scope["product:catalog"], 1);
         assert_eq!(stale_stats.memories_by_owner["shared"], 3);
         assert_eq!(stale_stats.memories_by_owner["agent:engineer"], 1);
         assert_eq!(stale_stats.memories_by_status["hot"], 3);

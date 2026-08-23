@@ -17,7 +17,7 @@ fn bench_conn(memory_count: usize) -> Connection {
             params![
                 format!("bench-memory-{idx:05}"),
                 format!("Bench Memory {idx:05}"),
-                "barista memory recall benchmark body",
+                "guide memory recall benchmark body",
                 format!("/tmp/bench-memory-{idx:05}.md"),
                 format!("hash-{idx:05}"),
                 i64::from(idx % 200 == 0),
@@ -46,7 +46,7 @@ fn acl_conn() -> Connection {
     .expect("insert explicit ACL");
     conn.execute(
         "INSERT INTO node_acl(owner_node, reader, granted)
-         VALUES('agent:orchestrator', '*', 0)",
+         VALUES('agent:researcher', '*', 0)",
         [],
     )
     .expect("insert wildcard ACL");
@@ -68,7 +68,7 @@ fn activation_recompute(c: &mut Criterion) {
 
 fn scope_fallthrough(c: &mut Criterion) {
     c.bench_function("scope_fallthrough_product", |b| {
-        b.iter(|| black_box(search::scope_fallthrough(black_box("product:notebook"))));
+        b.iter(|| black_box(search::scope_fallthrough(black_box("product:catalog"))));
     });
     c.bench_function("scope_fallthrough_company", |b| {
         b.iter(|| black_box(search::scope_fallthrough(black_box("company"))));
@@ -104,7 +104,7 @@ fn acl_resolution(c: &mut Criterion) {
         b.iter(|| {
             black_box(acl::can_read_owner(
                 &conn,
-                black_box("agent:orchestrator"),
+                black_box("agent:researcher"),
                 black_box("agent:engineer"),
             ))
             .expect("wildcard ACL")
@@ -115,7 +115,7 @@ fn acl_resolution(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .frontendple_size(10)
+        .sample_size(10)
         .warm_up_time(Duration::from_millis(200))
         .measurement_time(Duration::from_millis(500));
     targets = activation_recompute, scope_fallthrough, acl_resolution

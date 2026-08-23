@@ -5,7 +5,6 @@
 __pycache__/
 *.pyc
 /.coverage
-Cargo.lock
 uv.lock
 *.db
 *.db-*

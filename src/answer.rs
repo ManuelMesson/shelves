@@ -1,12 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc, Weekday};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::{acl, activation, search, storage};
+use crate::{
+    acl, activation,
+    locale::{LocaleRegistry, QueryIntent},
+    search, storage,
+};
 
 const BRIEF_MAX_LINES: usize = 20;
 const BRIEF_DUE_DAYS: i64 = 30;
@@ -14,12 +18,20 @@ const RELEVANCE_WEIGHT: f64 = 100.0;
 const ACTIVATION_WEIGHT: f64 = 1.0;
 const CORE_LOCK_BONUS: f64 = 0.1;
 const DEFAULT_CONTEXT_RELEVANCE_FLOOR: f64 = 0.66;
-const CURATOR_AUTHORED_CORE_LOCKS: &[&str] = &[
-    "actor-lanes",
-    "ground-rule-no-hallucination",
-    "memory-security-boundaries",
-    "zero-manual-cli",
-    "quality-bar-language-parity",
+const ORIENTATION_EPISODE_SCAN_LIMIT: usize = 2_000;
+const ORIENTATION_EPISODE_LIMIT: usize = 5;
+const ORIENTATION_HOT_LIMIT: usize = 3;
+const AGENT_CONTEXT_IDENTITY_LIMIT: usize = 4;
+const AGENT_CONTEXT_MEETING_LIMIT: usize = 3;
+const AGENT_CONTEXT_TASK_LIMIT: usize = 2;
+const CONTEXT_QUERY_LIMIT: usize = 4;
+const CONTEXT_SEARCH_LIMIT: usize = 10;
+const CORE_LOCKS: &[&str] = &[
+    "role-boundaries",
+    "accuracy-policy",
+    "data-boundaries",
+    "automation-policy",
+    "quality-policy",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +82,21 @@ pub struct MissRow {
     pub by: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct MissListRow {
+    pub id: i64,
+    pub ts: String,
+    pub what: String,
+    pub by: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentContextIntent {
+    Identity,
+    Meeting,
+    Task,
+}
+
 pub fn normalize_agent(agent: &str) -> String {
     let lowered = agent.trim().trim_start_matches('@').to_ascii_lowercase();
     if lowered.starts_with("agent:") {
@@ -77,6 +104,31 @@ pub fn normalize_agent(agent: &str) -> String {
     } else {
         format!("agent:{lowered}")
     }
+}
+
+fn agent_context_intent(agent: &str, task: &str) -> AgentContextIntent {
+    let query = task.to_ascii_lowercase();
+    let normalized = normalize_agent(agent);
+    let name = normalized.trim_start_matches("agent:");
+    let names_identity = query.contains(&format!("who is {name}"))
+        || (query.contains(name) && query.contains("current open work"));
+    if names_identity {
+        AgentContextIntent::Identity
+    } else if query.contains("meeting:") {
+        AgentContextIntent::Meeting
+    } else {
+        AgentContextIntent::Task
+    }
+}
+
+fn agent_owned_limit(intent: AgentContextIntent, max_lines: usize) -> usize {
+    let reserve = usize::from(max_lines >= 3) * 2;
+    let intent_limit = match intent {
+        AgentContextIntent::Identity => AGENT_CONTEXT_IDENTITY_LIMIT,
+        AgentContextIntent::Meeting => AGENT_CONTEXT_MEETING_LIMIT,
+        AgentContextIntent::Task => AGENT_CONTEXT_TASK_LIMIT,
+    };
+    intent_limit.min(max_lines.saturating_sub(reserve))
 }
 
 pub fn ask(
@@ -191,12 +243,25 @@ pub fn context(
     task: &str,
     budget: Option<usize>,
 ) -> Result<Vec<PackLine>> {
+    let locales = LocaleRegistry::installed()?;
+    context_with_locales(conn, agent, task, budget, &locales)
+}
+
+pub fn context_with_locales(
+    conn: &Connection,
+    agent: &str,
+    task: &str,
+    budget: Option<usize>,
+    locales: &LocaleRegistry,
+) -> Result<Vec<PackLine>> {
     let max_lines = budget.unwrap_or(storage::meta_usize(conn, "context_default_budget", 15)?);
     if max_lines == 0 {
         return Ok(Vec::new());
     }
+    let prepared = locales.prepare(task);
+    let ranking_query = prepared.search_text.as_str();
     let reader = normalize_agent(agent);
-    let terms = query_terms(task);
+    let terms = query_terms(ranking_query);
     let task_terms = if terms.is_empty() {
         None
     } else {
@@ -211,11 +276,52 @@ pub fn context(
     } else {
         None
     };
-    let relevance_scores =
-        search::memory_relevance_scores(conn, task, "company", &reader, false, 128)?;
+    let mut relevance_scores = HashMap::new();
+    let mut canonical_lock_scores = HashMap::new();
+    for query in context_ranking_queries(ranking_query) {
+        merge_relevance_scores(
+            &mut relevance_scores,
+            search::memory_relevance_scores(
+                conn,
+                query,
+                "company",
+                &reader,
+                false,
+                CONTEXT_SEARCH_LIMIT,
+            )?, // LCOV_EXCL_LINE: fallible search boundary; success asserted by context tests.
+        );
+        merge_relevance_scores(
+            &mut canonical_lock_scores,
+            search::lock_relevance_scores(conn, query, "company", CONTEXT_SEARCH_LIMIT)?,
+        );
+    }
     let mut lock_relevance_scores = relevance_scores.clone();
-    lock_relevance_scores.extend(search::lock_relevance_scores(conn, task, "company", 128)?);
-    let mut lines = Vec::new();
+    merge_relevance_scores(&mut lock_relevance_scores, canonical_lock_scores);
+    let agent_intent = agent_context_intent(agent, task);
+    let owned_limit = agent_owned_limit(agent_intent, max_lines);
+    let owned_lines = agent_owned_memory_lines(
+        conn,
+        &reader,
+        task_terms,
+        Some(&relevance_scores),
+        relevance_floor,
+        agent_intent,
+        owned_limit,
+    )?; // LCOV_EXCL_LINE: fallible pack boundary; success asserted by agent goldens.
+    if prepared.intent == QueryIntent::Orientation {
+        return orientation_context(
+            conn,
+            &reader,
+            &prepared.topic_text,
+            task_terms,
+            relevance_floor,
+            &relevance_scores,
+            &lock_relevance_scores,
+            owned_lines,
+            max_lines,
+        );
+    }
+    let mut lines = owned_lines;
     lines.extend(lock_lines(
         conn,
         &reader,
@@ -224,14 +330,15 @@ pub fn context(
         relevance_floor,
         max_lines,
     )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    lines.extend(hot_memory_lines(
+    let hot_lines = hot_memory_lines(
         conn,
         &reader,
         task_terms,
         Some(&relevance_scores),
         relevance_floor,
         max_lines.saturating_sub(lines.len()),
-    )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    extend_unique_lines(&mut lines, hot_lines);
     if !lines.iter().any(is_task_specific_line) {
         lines.extend(episode_precedent_lines(
             conn,
@@ -262,6 +369,54 @@ pub fn context(
     Ok(cap_lines(lines, max_lines))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn orientation_context(
+    conn: &Connection,
+    reader: &str,
+    task: &str,
+    task_terms: Option<&[String]>,
+    relevance_floor: Option<f64>,
+    relevance_scores: &HashMap<i64, f64>,
+    lock_relevance_scores: &HashMap<i64, f64>,
+    owned_lines: Vec<PackLine>,
+    max_lines: usize,
+) -> Result<Vec<PackLine>> {
+    let lock_reserve = usize::from(max_lines >= 3) * 2;
+    let owned_count = owned_lines.len();
+    let state_budget = max_lines
+        .saturating_sub(lock_reserve)
+        .saturating_sub(owned_count);
+    let mut lines = owned_lines;
+    lines.extend(orientation_episode_lines(
+        conn,
+        task,
+        ORIENTATION_EPISODE_LIMIT.min(state_budget),
+    )?); // LCOV_EXCL_LINE: fallible episode boundary; success asserted by orientation goldens.
+    let state_used = lines.len().saturating_sub(owned_count);
+    let hot_limit = ORIENTATION_HOT_LIMIT.min(state_budget.saturating_sub(state_used));
+    let hot_lines = hot_memory_lines(
+        conn,
+        reader,
+        task_terms,
+        Some(relevance_scores),
+        None,
+        hot_limit,
+    )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    extend_unique_lines(&mut lines, hot_lines);
+    lines.extend(lock_lines(
+        conn,
+        reader,
+        task_terms,
+        Some(lock_relevance_scores),
+        relevance_floor,
+        max_lines.saturating_sub(lines.len()),
+    )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    if !lines.iter().any(is_task_specific_line) {
+        lines.push(nothing_specific_line());
+    }
+    Ok(cap_lines(lines, max_lines))
+}
+
 pub fn missed(conn: &Connection, what: &str, by: &str) -> Result<MissRow> {
     let actor = normalize_agent(by);
     let id = storage::insert_miss(conn, what, &actor)?;
@@ -270,6 +425,26 @@ pub fn missed(conn: &Connection, what: &str, by: &str) -> Result<MissRow> {
         what: what.to_string(),
         by: actor,
     })
+}
+
+pub fn misses(conn: &Connection, since_days: Option<u32>) -> Result<Vec<MissListRow>> {
+    let cutoff = since_days.map(|days| (Utc::now() - Duration::days(i64::from(days))).to_rfc3339());
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, summary, actor
+         FROM episodes
+         WHERE kind = 'miss' AND (?1 IS NULL OR ts >= ?1)
+         ORDER BY ts DESC, id DESC",
+    )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    let rows = stmt.query_map(params![cutoff], |row| {
+        Ok(MissListRow {
+            id: row.get(0)?,
+            ts: row.get(1)?,
+            what: row.get(2)?,
+            by: row.get(3)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 pub fn related(conn: &Connection, name: &str) -> Result<Vec<RelatedRow>> {
@@ -363,11 +538,14 @@ fn lock_lines(
             continue; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
         let relevance = row_relevance(&row, terms, relevance_scores);
+        let retrieved = has_relevance_score(&row, relevance_scores)
+            && min_relevance.is_some_and(|floor| floor <= DEFAULT_CONTEXT_RELEVANCE_FLOOR);
         let core = is_core_lock(&row);
         if terms.is_some() && relevance <= 0.0 && !core {
             continue;
         }
         if !core
+            && !retrieved
             && min_relevance.is_some_and(|floor| row_term_relevance(&row, terms, relevance) < floor)
         {
             continue;
@@ -421,13 +599,18 @@ fn hot_memory_lines(
             continue; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
         let relevance = row_relevance(&row, terms, relevance_scores);
+        let retrieved = has_relevance_score(&row, relevance_scores)
+            && min_relevance.is_some_and(|floor| floor <= DEFAULT_CONTEXT_RELEVANCE_FLOOR);
         if terms.is_some() && relevance <= 0.0 {
             continue;
         }
-        if min_relevance.is_some_and(|floor| row_term_relevance(&row, terms, relevance) < floor) {
+        if !retrieved
+            && min_relevance.is_some_and(|floor| row_term_relevance(&row, terms, relevance) < floor)
+        {
             continue;
         }
         if min_relevance.is_some()
+            && !retrieved
             && terms.is_some_and(|items| {
                 !context_tail_signal_strong(&row.name, &row.title, &row.body, items)
             })
@@ -459,6 +642,109 @@ fn hot_memory_lines(
             )
         })
         .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_owned_memory_lines(
+    conn: &Connection,
+    reader: &str,
+    terms: Option<&[String]>,
+    relevance_scores: Option<&HashMap<i64, f64>>,
+    min_relevance: Option<f64>,
+    intent: AgentContextIntent,
+    limit: usize,
+) -> Result<Vec<PackLine>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let decay = storage::meta_f64(conn, "decay_d", 0.5)?;
+    let now = Utc::now();
+    let mut candidates = Vec::new();
+    for row in memory_rows(conn, "is_lock = 0 AND status != 'archived'")? {
+        if row.owner != reader || !scoped_for_company(&row.scope) {
+            continue;
+        }
+        let relevance = row_relevance(&row, terms, relevance_scores);
+        if !agent_owned_row_matches(&row, terms, relevance_scores, min_relevance, intent) {
+            continue;
+        }
+        let activation = activation::memory_activation(conn, row.id, now, decay)?;
+        candidates.push(AgentOwnedMemory {
+            source_priority: agent_source_priority(&row.source_path, intent),
+            row,
+            relevance,
+            activation,
+        });
+    }
+    sort_agent_owned_memories(&mut candidates);
+    Ok(candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| {
+            let stale = source_stale(conn, &candidate.row.source_path).unwrap_or(false);
+            pack_line(
+                "agent-memory",
+                &candidate.row,
+                candidate.activation,
+                stale,
+                agent_owned_reason(intent),
+            )
+        })
+        .collect())
+}
+
+fn agent_owned_row_matches(
+    row: &MemoryRow,
+    terms: Option<&[String]>,
+    relevance_scores: Option<&HashMap<i64, f64>>,
+    min_relevance: Option<f64>,
+    intent: AgentContextIntent,
+) -> bool {
+    let source_priority = agent_source_priority(&row.source_path, intent);
+    if intent == AgentContextIntent::Identity && source_priority > 0 {
+        return true;
+    }
+    let Some(terms) = terms else {
+        return false;
+    };
+    if has_relevance_score(row, relevance_scores) {
+        return true;
+    }
+    let floor = min_relevance.unwrap_or(DEFAULT_CONTEXT_RELEVANCE_FLOOR);
+    row_term_relevance(row, Some(terms), 0.0) >= floor
+}
+
+fn agent_source_priority(source_path: &str, intent: AgentContextIntent) -> u8 {
+    if intent != AgentContextIntent::Identity {
+        return 0;
+    }
+    if source_path.contains("/agents/") {
+        3
+    } else if source_path.contains("bootstrap") {
+        2
+    } else {
+        1
+    }
+}
+
+fn agent_owned_reason(intent: AgentContextIntent) -> &'static str {
+    match intent {
+        AgentContextIntent::Identity => "agent-owned-identity",
+        AgentContextIntent::Meeting => "agent-owned-meeting",
+        AgentContextIntent::Task => "agent-owned-task",
+    }
+}
+
+fn extend_unique_lines(lines: &mut Vec<PackLine>, additions: Vec<PackLine>) {
+    let mut seen = lines
+        .iter()
+        .map(|line| (line.source_path.clone(), line.title.clone()))
+        .collect::<HashSet<_>>();
+    for line in additions {
+        if seen.insert((line.source_path.clone(), line.title.clone())) {
+            lines.push(line);
+        }
+    }
 }
 
 fn future_lines(conn: &Connection, days: Option<i64>, limit: usize) -> Result<Vec<PackLine>> {
@@ -622,6 +908,143 @@ fn episode_precedent_lines(
     Ok(lines)
 }
 
+#[derive(Debug)]
+struct OrientationEpisode {
+    line: PackLine,
+    matched_terms: usize,
+    ts: Option<DateTime<Utc>>,
+    id: i64,
+}
+
+fn orientation_episode_lines(conn: &Connection, task: &str, limit: usize) -> Result<Vec<PackLine>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let topic_terms = orientation_topic_terms(task);
+    let anchor = orientation_anchor_date(task, Local::now().date_naive());
+    let mut candidates = orientation_episode_candidates(conn, &topic_terms)?;
+    candidates.sort_by(|a, b| match anchor {
+        Some(_) => orientation_anchor_distance(a, anchor)
+            .cmp(&orientation_anchor_distance(b, anchor))
+            .then_with(|| b.matched_terms.cmp(&a.matched_terms))
+            .then_with(|| b.ts.cmp(&a.ts))
+            .then_with(|| b.id.cmp(&a.id)),
+        None => {
+            b.ts.cmp(&a.ts)
+                .then_with(|| b.matched_terms.cmp(&a.matched_terms))
+                .then_with(|| b.id.cmp(&a.id))
+        }
+    });
+    let mut seen = HashSet::new();
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| {
+            seen.insert((
+                candidate.line.title.clone(),
+                candidate.line.body.clone(),
+                candidate.line.source_path.clone(),
+            ))
+        })
+        .take(limit)
+        .map(|candidate| candidate.line)
+        .collect())
+}
+
+fn orientation_anchor_distance(candidate: &OrientationEpisode, anchor: Option<NaiveDate>) -> i64 {
+    match (anchor, candidate.ts) {
+        (Some(anchor), Some(ts)) => (ts.date_naive() - anchor).num_days().abs(),
+        (Some(_), None) => i64::MAX,
+        (None, _) => 0,
+    }
+}
+
+fn orientation_episode_candidates(
+    conn: &Connection,
+    topic_terms: &[String],
+) -> Result<Vec<OrientationEpisode>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, summary, coalesce(body, ''), actor, scope, coalesce(source_path, '')
+         FROM episodes
+         WHERE kind != 'miss'
+         ORDER BY ts DESC, id DESC
+         LIMIT ?1",
+    )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+    let rows = stmt.query_map(params![ORIENTATION_EPISODE_SCAN_LIMIT as i64], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (id, ts, summary, body, owner, scope, source_path) = row?;
+        if !scoped_for_company(&scope) {
+            continue;
+        }
+        if let Some(candidate) = orientation_episode_candidate(
+            id,
+            &ts,
+            summary,
+            body,
+            owner,
+            scope,
+            source_path,
+            topic_terms,
+        ) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn orientation_episode_candidate(
+    id: i64,
+    ts: &str,
+    summary: String,
+    body: String,
+    owner: String,
+    scope: String,
+    source_path: String,
+    topic_terms: &[String],
+) -> Option<OrientationEpisode> {
+    let haystack = format!("{summary}\n{body}").to_ascii_lowercase();
+    let matched_terms = topic_terms
+        .iter()
+        .filter(|term| context_floor_term_matches(&haystack, term))
+        .count();
+    let minimum = usize::from(topic_terms.len() >= 3) + usize::from(!topic_terms.is_empty());
+    if (topic_terms.is_empty() && !has_orientation_state_signal(&haystack))
+        || (!topic_terms.is_empty() && matched_terms < minimum)
+    {
+        return None;
+    }
+    Some(OrientationEpisode {
+        line: PackLine {
+            section: "episodic-precedent".to_string(),
+            title: summary,
+            body: body.chars().take(240).collect(),
+            source_path,
+            scope,
+            owner,
+            reason: "recent-orientation".to_string(),
+            activation: None,
+            stale: false,
+            confidence: confidence_markers(&body),
+        },
+        matched_terms,
+        ts: DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|value| value.with_timezone(&Utc)),
+        id,
+    })
+}
+
 fn is_task_specific_line(line: &PackLine) -> bool {
     line.reason != "house-rule-core" && line.section != "nothing-specific"
 }
@@ -664,7 +1087,7 @@ fn memory_rows(conn: &Connection, predicate: &str) -> Result<Vec<MemoryRow>> {
             id: row.get(0)?,
             name: row.get(1)?,
             title: row.get(2)?,
-            body: row.get::<_, String>(3)?.chars().take(320).collect(),
+            body: row.get(3)?,
             owner: row.get(4)?,
             scope: row.get(5)?,
             source_path: row.get(6)?,
@@ -690,7 +1113,7 @@ fn lock_store_rows(conn: &Connection) -> Result<Vec<MemoryRow>> {
             id: -id,
             name: row.get(1)?,
             title: row.get(2)?,
-            body: row.get::<_, String>(3)?.chars().take(320).collect(),
+            body: row.get(3)?,
             owner: "shared".to_string(),
             scope: row.get(4)?,
             source_path: source_path.clone(),
@@ -707,6 +1130,14 @@ struct ScoredMemory {
     relevance: f64,
     activation: Option<f64>,
     core: bool,
+}
+
+#[derive(Debug)]
+struct AgentOwnedMemory {
+    row: MemoryRow,
+    relevance: f64,
+    activation: Option<f64>,
+    source_priority: u8,
 }
 
 impl ScoredMemory {
@@ -729,9 +1160,18 @@ fn sort_scored_memories(candidates: &mut [ScoredMemory]) {
     });
 }
 
+fn sort_agent_owned_memories(candidates: &mut [AgentOwnedMemory]) {
+    candidates.sort_by(|a, b| {
+        b.source_priority
+            .cmp(&a.source_priority)
+            .then_with(|| b.relevance.total_cmp(&a.relevance))
+            .then_with(|| a.row.title.cmp(&b.row.title))
+    });
+}
+
 fn is_core_lock(row: &MemoryRow) -> bool {
     let haystack = format!("{}\n{}", row.name, row.body).to_ascii_lowercase();
-    CURATOR_AUTHORED_CORE_LOCKS
+    CORE_LOCKS
         .iter()
         .any(|slug| row.name == *slug || haystack.contains(slug))
 }
@@ -754,6 +1194,10 @@ fn row_relevance(
     }
 }
 
+fn has_relevance_score(row: &MemoryRow, relevance_scores: Option<&HashMap<i64, f64>>) -> bool {
+    relevance_scores.is_some_and(|scores| scores.contains_key(&row.id))
+}
+
 fn row_term_relevance(row: &MemoryRow, terms: Option<&[String]>, fallback: f64) -> f64 {
     terms
         .map(|items| context_floor_relevance(&row.name, &row.title, &row.body, items))
@@ -762,7 +1206,7 @@ fn row_term_relevance(row: &MemoryRow, terms: Option<&[String]>, fallback: f64) 
 
 fn context_floor_relevance(name: &str, title: &str, body: &str, terms: &[String]) -> f64 {
     let signal_terms = context_signal_terms(terms);
-    if !signal_terms.is_empty() {
+    if signal_terms.len() >= 2 {
         return context_signal_relevance(name, title, body, &signal_terms);
     }
     let floor_terms = terms.to_vec();
@@ -934,7 +1378,7 @@ fn pack_line(
     PackLine {
         section: section.to_string(),
         title: row.title.clone(),
-        body: row.body.clone(),
+        body: row.body.chars().take(320).collect(),
         source_path: row.source_path.clone(),
         scope: row.scope.clone(),
         owner: row.owner.clone(),
@@ -978,6 +1422,123 @@ fn query_terms(query: &str) -> Vec<String> {
         .take(12)
         .map(|term| term.to_ascii_lowercase())
         .collect()
+}
+
+fn context_ranking_queries(query: &str) -> Vec<&str> {
+    let trimmed = query.trim();
+    let segments = trimmed
+        .split(';')
+        .flat_map(|segment| segment.split(" / "))
+        .flat_map(|segment| segment.split(" — "))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return vec![trimmed];
+    }
+    std::iter::once(trimmed)
+        .chain(segments)
+        .take(CONTEXT_QUERY_LIMIT)
+        .collect()
+}
+
+fn merge_relevance_scores(target: &mut HashMap<i64, f64>, incoming: HashMap<i64, f64>) {
+    for (id, score) in incoming {
+        target
+            .entry(id)
+            .and_modify(|current| *current = current.max(score))
+            .or_insert(score);
+    }
+}
+
+#[cfg(test)]
+fn is_orientation_query(query: &str) -> bool {
+    crate::locale::LocaleRegistry::empty().prepare(query).intent == QueryIntent::Orientation
+}
+
+fn orientation_topic_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 2)
+        .map(|term| term.to_ascii_lowercase())
+        .filter(|term| !search::is_query_stopword(term) && !is_orientation_filler(term))
+    {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn orientation_anchor_date(query: &str, today: NaiveDate) -> Option<NaiveDate> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .find_map(parse_weekday)
+        .map(|weekday| most_recent_weekday(today, weekday))
+}
+
+fn parse_weekday(term: &str) -> Option<Weekday> {
+    match term.to_ascii_lowercase().as_str() {
+        "monday" => Some(Weekday::Mon),
+        "tuesday" => Some(Weekday::Tue),
+        "wednesday" => Some(Weekday::Wed),
+        "thursday" => Some(Weekday::Thu),
+        "friday" => Some(Weekday::Fri),
+        "saturday" => Some(Weekday::Sat),
+        "sunday" => Some(Weekday::Sun),
+        _ => None,
+    }
+}
+
+fn most_recent_weekday(today: NaiveDate, weekday: Weekday) -> NaiveDate {
+    let today_index = today.weekday().num_days_from_monday();
+    let target_index = weekday.num_days_from_monday();
+    let days_ago = (today_index + 7 - target_index) % 7;
+    today - Duration::days(i64::from(days_ago))
+}
+
+fn is_orientation_filler(term: &str) -> bool {
+    matches!(
+        term,
+        "current"
+            | "happened"
+            | "last"
+            | "latest"
+            | "matters"
+            | "orientation"
+            | "recent"
+            | "state"
+            | "status"
+            | "today"
+            | "update"
+            | "where"
+            | "yesterday"
+            | "monday"
+            | "tuesday"
+            | "wednesday"
+            | "thursday"
+            | "friday"
+            | "saturday"
+            | "sunday"
+    )
+}
+
+fn has_orientation_state_signal(text: &str) -> bool {
+    [
+        "blocked",
+        "closed",
+        "completed",
+        "decision",
+        "meeting-closed",
+        "mandate",
+        "next action",
+        "order",
+        "priority",
+        "shipped",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
 }
 
 fn matches_terms(title: &str, body: &str, terms: &[String]) -> bool {
@@ -1032,6 +1593,60 @@ mod tests {
     fn future_item_validation_rejects_garbage() {
         assert!(validate_iso_date("2026-06-13").is_ok());
         assert!(validate_iso_date("06/13/2026").is_err());
+    }
+
+    #[test]
+    fn english_agent_intent_sharpens_but_plain_tasks_still_get_a_blend() {
+        assert_eq!(
+            agent_context_intent("Writer", "who is Writer, current open work"),
+            AgentContextIntent::Identity
+        );
+        assert_eq!(
+            agent_context_intent("agent:engineer", "meeting: delta index migration"),
+            AgentContextIntent::Meeting
+        );
+        assert_eq!(
+            agent_context_intent(
+                "engineer",
+                "shelves public repo proof parity acl scopes public CI workflow"
+            ),
+            AgentContextIntent::Task
+        );
+        assert_eq!(agent_owned_limit(AgentContextIntent::Task, 10), 2);
+        assert_eq!(agent_owned_limit(AgentContextIntent::Identity, 10), 4);
+
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        assert!(
+            agent_owned_memory_lines(
+                &conn,
+                "agent:engineer",
+                None,
+                None,
+                None,
+                AgentContextIntent::Task,
+                0,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let row = MemoryRow {
+            id: 1,
+            name: "unmatched".to_string(),
+            title: "Unmatched".to_string(),
+            body: "No query terms.".to_string(),
+            owner: "agent:engineer".to_string(),
+            scope: "company".to_string(),
+            source_path: "/synthetic/memory/engineer/note.md".to_string(),
+            is_lock: false,
+        };
+        assert!(!agent_owned_row_matches(
+            &row,
+            None,
+            None,
+            None,
+            AgentContextIntent::Task,
+        ));
     }
 
     #[test]
@@ -1096,7 +1711,7 @@ mod tests {
             storage::insert_future_item(&conn, "future", "2026-06-13", "agent:engineer").unwrap();
         done(&conn, id, false).unwrap();
 
-        let lines = brief(&conn, "curator").unwrap();
+        let lines = brief(&conn, "coordinator").unwrap();
 
         assert!(
             lines
@@ -1134,7 +1749,7 @@ mod tests {
         storage::log_recall_event(&conn, 2, "agent:engineer", "company").unwrap();
         storage::insert_future_item(&conn, "future", "2026-06-13", "agent:engineer").unwrap();
 
-        let lines = brief(&conn, "curator").unwrap();
+        let lines = brief(&conn, "coordinator").unwrap();
         assert_eq!(lines[0].section, "active-lock");
         assert!(
             lines
@@ -1154,12 +1769,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         assert!(
-            lock_lines(&conn, "agent:curator", None, None, None, 0)
+            lock_lines(&conn, "agent:coordinator", None, None, None, 0)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            hot_memory_lines(&conn, "agent:curator", None, None, None, 0)
+            hot_memory_lines(&conn, "agent:coordinator", None, None, None, 0)
                 .unwrap()
                 .is_empty()
         );
@@ -1167,13 +1782,13 @@ mod tests {
         assert!(yesterday_lines(&conn, 0).unwrap().is_empty());
 
         let mut product = memory_doc("product-only", false);
-        product.scope = "personal".to_string();
-        product.content_hash = "hash-personal".to_string();
+        product.scope = "protected".to_string();
+        product.content_hash = "hash-protected".to_string();
         storage::upsert_memory(&conn, &product).unwrap();
         insert_memory(&conn, "dispatch lock", true);
         let terms = vec!["missing".to_string()];
         assert!(
-            lock_lines(&conn, "agent:curator", Some(&terms), None, None, 5)
+            lock_lines(&conn, "agent:coordinator", Some(&terms), None, None, 5)
                 .unwrap()
                 .is_empty()
         );
@@ -1251,7 +1866,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         assert!(
-            context(&conn, "curator", "anything", Some(0))
+            context(&conn, "coordinator", "anything", Some(0))
                 .unwrap()
                 .is_empty()
         );
@@ -1326,7 +1941,7 @@ mod tests {
             !ask(
                 &conn,
                 "archivist",
-                "closing console",
+                "archive rotation",
                 "agent:engineer",
                 "company",
                 false,
@@ -1344,7 +1959,7 @@ mod tests {
             ask(
                 &conn,
                 "archivist",
-                "closing console",
+                "archive rotation",
                 "agent:engineer",
                 "company",
                 false,
@@ -1363,9 +1978,268 @@ mod tests {
         insert_memory(&conn, "dispatch hot", false);
         storage::log_recall_event(&conn, 2, "agent:engineer", "company").unwrap();
 
-        let lines = context(&conn, "curator", "dispatch ticket", Some(2)).unwrap();
+        let lines = context(&conn, "coordinator", "dispatch ticket", Some(2)).unwrap();
         assert_eq!(lines[0].section, "active-lock");
         assert!(lines.len() <= 2);
+    }
+
+    #[test]
+    fn empty_locale_registry_preserves_english_context_ranking() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_memory(&conn, "dispatch lock", true);
+        insert_memory(&conn, "dispatch hot", false);
+        storage::log_recall_event(&conn, 2, "agent:engineer", "company").unwrap();
+        let task = "dispatch ticket";
+
+        let without_locales = context_with_locales(
+            &conn,
+            "coordinator",
+            task,
+            Some(2),
+            &LocaleRegistry::empty(),
+        )
+        .unwrap();
+        let with_bundled = context_with_locales(
+            &conn,
+            "coordinator",
+            task,
+            Some(2),
+            &LocaleRegistry::bundled().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            without_locales
+                .iter()
+                .map(|line| (&line.section, &line.title, &line.reason))
+                .collect::<Vec<_>>(),
+            with_bundled
+                .iter()
+                .map(|line| (&line.section, &line.title, &line.reason))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn orientation_intent_and_topic_terms_are_narrow() {
+        assert!(is_orientation_query(
+            "what happened last night and what matters this morning"
+        ));
+        assert!(is_orientation_query("give me a status update"));
+        assert!(!is_orientation_query(
+            "what is the policy on widget retention"
+        ));
+        assert_eq!(
+            orientation_topic_terms(
+                "Tuesday morning orientation: what happened with the widget night-shift queue today"
+            ),
+            ["morning", "widget", "night", "shift", "queue"]
+        );
+        let saturday = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
+        assert_eq!(
+            orientation_anchor_date("Tuesday morning orientation", saturday),
+            NaiveDate::from_ymd_opt(2026, 7, 21)
+        );
+        assert_eq!(
+            orientation_anchor_date("Saturday status update", saturday),
+            Some(saturday)
+        );
+        assert_eq!(orientation_anchor_date("recent state", saturday), None);
+    }
+
+    #[test]
+    fn orientation_episode_candidate_requires_topical_or_state_signal() {
+        let topical = [
+            "widget".to_string(),
+            "queue".to_string(),
+            "night".to_string(),
+        ];
+        let candidate = orientation_episode_candidate(
+            7,
+            "not-a-timestamp",
+            "Widget Queue Decision".to_string(),
+            "The widget queue changed.".to_string(),
+            "agent:assistant".to_string(),
+            "company".to_string(),
+            "synthetic/decision.md".to_string(),
+            &topical,
+        )
+        .unwrap();
+        assert_eq!(candidate.matched_terms, 2);
+        assert!(candidate.ts.is_none());
+        assert_eq!(candidate.line.reason, "recent-orientation");
+        let anchor = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap();
+        assert_eq!(
+            orientation_anchor_distance(&candidate, Some(anchor)),
+            i64::MAX
+        );
+        assert_eq!(orientation_anchor_distance(&candidate, None), 0);
+
+        assert!(
+            orientation_episode_candidate(
+                8,
+                "2026-07-25T00:00:00Z",
+                "Widget Note".to_string(),
+                "Only one topical match.".to_string(),
+                "agent:assistant".to_string(),
+                "company".to_string(),
+                "synthetic/note.md".to_string(),
+                &topical,
+            )
+            .is_none()
+        );
+        assert!(
+            orientation_episode_candidate(
+                9,
+                "2026-07-25T00:00:00Z",
+                "Routine note".to_string(),
+                "No state transition here.".to_string(),
+                "agent:assistant".to_string(),
+                "company".to_string(),
+                "synthetic/routine.md".to_string(),
+                &[],
+            )
+            .is_none()
+        );
+        assert!(
+            orientation_episode_candidate(
+                10,
+                "2026-07-25T00:00:00Z",
+                "Priority decision".to_string(),
+                "The next action is selected.".to_string(),
+                "agent:assistant".to_string(),
+                "company".to_string(),
+                "synthetic/priority.md".to_string(),
+                &[],
+            )
+            .is_some()
+        );
+        let dated = orientation_episode_candidate(
+            11,
+            "2026-07-25T12:00:00Z",
+            "Priority decision".to_string(),
+            "The next action is selected.".to_string(),
+            "agent:assistant".to_string(),
+            "company".to_string(),
+            "synthetic/dated.md".to_string(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(orientation_anchor_distance(&dated, Some(anchor)), 0);
+    }
+
+    #[test]
+    fn orientation_episode_lines_are_bounded_scoped_and_deduplicated() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        assert!(
+            orientation_episode_lines(&conn, "morning orientation widget queue", 0)
+                .unwrap()
+                .is_empty()
+        );
+        conn.execute_batch(
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES
+               ('2026-07-25T03:00:00Z', 'agent:assistant', 'note', 'Widget Queue Decision',
+                'Morning widget queue decision', 'company', 'synthetic/decision.md'),
+               ('2026-07-25T02:00:00Z', 'agent:assistant', 'note', 'Widget Queue Decision',
+                'Morning widget queue decision', 'company', 'synthetic/decision.md'),
+               ('2026-07-25T04:00:00Z', 'agent:assistant', 'note', 'Private Widget Queue',
+                'Morning widget queue decision', 'protected', 'synthetic/private.md'),
+               ('2026-07-25T01:00:00Z', 'agent:assistant', 'miss', 'Missed Widget Queue',
+                'Morning widget queue decision', 'company', '');",
+        )
+        .unwrap();
+
+        let lines =
+            orientation_episode_lines(&conn, "morning orientation widget queue", 5).unwrap();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].title, "Widget Queue Decision");
+        let anchored =
+            orientation_episode_lines(&conn, "Tuesday morning orientation widget queue", 5)
+                .unwrap();
+        assert_eq!(anchored.len(), 1);
+    }
+
+    #[test]
+    fn orientation_context_orders_state_before_hot_memory_and_core_locks() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_named_memory(
+            &conn,
+            "role-boundaries",
+            "Role Boundaries",
+            "Standing execution roles remain stable.",
+            true,
+        );
+        insert_named_memory(
+            &conn,
+            "widget-queue-hot",
+            "Widget Queue Hot Memory",
+            "Morning widget queue orientation priority.",
+            false,
+        );
+        storage::log_recall_event(&conn, 2, "agent:assistant", "company").unwrap();
+        conn.execute(
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES(?1, 'agent:assistant', 'note', 'Widget Queue Decision',
+                    'Morning widget queue decision', 'company', 'synthetic/decision.md')",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        storage::rebuild_fts(&conn).unwrap();
+
+        let lines = context(
+            &conn,
+            "assistant",
+            "morning orientation widget queue",
+            Some(10),
+        )
+        .unwrap();
+        let episode = lines
+            .iter()
+            .position(|line| line.section == "episodic-precedent")
+            .unwrap();
+        let hot = lines
+            .iter()
+            .position(|line| line.section == "hot-memory")
+            .unwrap();
+        let lock = lines
+            .iter()
+            .position(|line| line.section == "active-lock")
+            .unwrap();
+        assert!(episode < hot && hot < lock);
+
+        let empty = Connection::open_in_memory().unwrap();
+        schema::init_db(&empty).unwrap();
+        let fallback = context(&empty, "assistant", "status update", Some(5)).unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].section, "nothing-specific");
+    }
+
+    #[test]
+    fn misses_list_filters_by_age_and_orders_newest_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        storage::insert_miss(&conn, "current miss", "agent:assistant").unwrap();
+        conn.execute(
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES('2000-01-01T00:00:00Z', 'agent:archivist', 'miss', 'old miss',
+                    'old miss', 'company', '')",
+            [],
+        )
+        .unwrap();
+
+        let all = misses(&conn, None).unwrap();
+        assert_eq!(
+            all.iter().map(|row| row.what.as_str()).collect::<Vec<_>>(),
+            ["current miss", "old miss"]
+        );
+        let recent = misses(&conn, Some(1)).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].what, "current miss");
     }
 
     #[test]
@@ -1374,16 +2248,16 @@ mod tests {
         schema::init_db(&conn).unwrap();
         insert_named_memory(
             &conn,
-            "actor-lanes",
-            "Actor Lanes",
-            "Operator decides. Curator routes. Builder executes.",
+            "role-boundaries",
+            "Role Boundaries",
+            "Maintainer approves. Coordinator routes. Builder executes.",
             true,
         );
         insert_named_memory(
             &conn,
-            "memory-security-boundaries",
+            "data-boundaries",
             "Memory Security Boundaries",
-            "Layer-1 personal data stays outside Builder and product agents.",
+            "Protected data stays outside untrusted callers.",
             true,
         );
         insert_lock_store_entry(
@@ -1394,9 +2268,9 @@ mod tests {
         );
         insert_lock_store_entry(
             &conn,
-            "notebook-positioning-hook-value-moat",
+            "catalog-positioning-hook-value-moat",
             "Notebook Positioning",
-            "Public launch tweet: score hook, Advisor value, memory compounding moat.",
+            "Release note: deterministic recall, bounded context, and reproducible tests.",
         );
         insert_named_memory(
             &conn,
@@ -1417,15 +2291,15 @@ mod tests {
 
         let test_pack = context(
             &conn,
-            "curator",
+            "coordinator",
             "fix a failing python test in the shelves",
             Some(10),
         )
         .unwrap();
         let tweet_pack = context(
             &conn,
-            "curator",
-            "write a public launch tweet for Notebook",
+            "coordinator",
+            "write a release note for Notebook",
             Some(10),
         )
         .unwrap();
@@ -1458,13 +2332,13 @@ mod tests {
         assert_eq!(
             test_pack
                 .iter()
-                .find(|line| line.title == "Actor Lanes")
+                .find(|line| line.title == "Role Boundaries")
                 .map(|line| line.reason.as_str()),
             Some("house-rule-core")
         );
         assert_eq!(lexical_relevance("name", "title", "body", &[]), 0.0);
         for pack in [test_pack, tweet_pack] {
-            assert!(pack.iter().any(|line| line.title == "Actor Lanes"));
+            assert!(pack.iter().any(|line| line.title == "Role Boundaries"));
             assert!(
                 pack.iter()
                     .any(|line| line.title == "Memory Security Boundaries")
@@ -1478,9 +2352,9 @@ mod tests {
         schema::init_db(&conn).unwrap();
         insert_named_memory(
             &conn,
-            "actor-lanes",
-            "Actor Lanes",
-            "Operator decides. Curator routes. Builder executes.",
+            "role-boundaries",
+            "Role Boundaries",
+            "Maintainer approves. Coordinator routes. Builder executes.",
             true,
         );
         insert_named_memory(
@@ -1494,16 +2368,16 @@ mod tests {
 
         let lines = context(
             &conn,
-            "curator",
+            "coordinator",
             "espresso machine maintenance schedule for the third floor",
             Some(10),
         )
         .unwrap();
 
         assert!(
-            lines
-                .iter()
-                .any(|line| { line.title == "Actor Lanes" && line.reason == "house-rule-core" })
+            lines.iter().any(|line| {
+                line.title == "Role Boundaries" && line.reason == "house-rule-core"
+            })
         );
         assert!(lines.iter().all(|line| line.title != "Maintenance Bleed"));
         assert!(lines.iter().any(|line| {
@@ -1518,9 +2392,9 @@ mod tests {
         schema::init_db(&conn).unwrap();
         insert_named_memory(
             &conn,
-            "actor-lanes",
-            "Actor Lanes",
-            "Operator decides. Curator routes. Builder executes.",
+            "role-boundaries",
+            "Role Boundaries",
+            "Maintainer approves. Coordinator routes. Builder executes.",
             true,
         );
         insert_lock_store_entry(
@@ -1531,21 +2405,189 @@ mod tests {
         );
         insert_lock_store_entry(
             &conn,
-            "off-topic-note",
-            "Off-Topic Note",
-            "An unrelated note that should not surface.",
+            "conference-demo-noise",
+            "Conference Demo Noise",
+            "A Notebook example for product framing.",
         );
         storage::rebuild_fts(&conn).unwrap();
 
-        let lines = context(&conn, "curator", "fix a python test in notebook", Some(10)).unwrap();
+        let lines = context(
+            &conn,
+            "coordinator",
+            "fix a python test in catalog",
+            Some(10),
+        )
+        .unwrap();
 
         assert!(
             lines
                 .iter()
                 .any(|line| line.title == "Shelves Testing Standard")
         );
-        assert!(lines.iter().all(|line| line.title != "Off-Topic Note"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.title != "Conference Demo Noise")
+        );
         assert!(lines.iter().all(|line| line.section != "nothing-specific"));
+    }
+
+    #[test]
+    fn context_keeps_clean_gate_lock_and_all_standing_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        for (name, title) in [
+            ("role-boundaries", "Role Boundaries"),
+            ("accuracy-policy", "Accuracy Policy"),
+            ("data-boundaries", "Memory Security Boundaries"),
+            ("automation-policy", "Zero Manual CLI"),
+            ("quality-policy", "Quality Bar = Language Parity"),
+        ] {
+            insert_named_memory(
+                &conn,
+                name,
+                title,
+                "Standing company rule for every agent session.",
+                true,
+            );
+        }
+        insert_lock_store_entry(
+            &conn,
+            "describe-the-tuesday-before-recommending-a-door",
+            "Describe the Tuesday Before Recommending a Door — a clean gate is not a want",
+            "No job is recommended before describing the Tuesday. A clean gate says they will let a candidate in; it does not say they want that family of jobs.",
+        );
+        storage::rebuild_fts(&conn).unwrap();
+        storage::rebuild_locks_fts(&conn).unwrap();
+
+        let lines = context(
+            &conn,
+            "coordinator",
+            "job search: what family of jobs is the candidate looking for, clean gate rule",
+            Some(15),
+        )
+        .unwrap();
+        let titles = lines
+            .iter()
+            .map(|line| line.title.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            titles
+                .iter()
+                .any(|title| title.contains("Describe the Tuesday"))
+        );
+        for standing in [
+            "Role Boundaries",
+            "Accuracy Policy",
+            "Memory Security Boundaries",
+            "Zero Manual CLI",
+            "Quality Bar = Language Parity",
+        ] {
+            assert!(titles.contains(&standing));
+        }
+        assert!(lines.iter().all(|line| line.section != "nothing-specific"));
+    }
+
+    #[test]
+    fn context_keeps_every_canonical_lock_returned_by_public_search() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_lock_store_entry(
+            &conn,
+            "error-handling-observability-standard",
+            "Error Handling & Observability Standard",
+            &format!(
+                "Error handling is a first-class feature. {} Never console only: surface a human message.",
+                "operational detail ".repeat(24)
+            ),
+        );
+        storage::rebuild_locks_fts(&conn).unwrap();
+        let query = "error handling never console only human message";
+
+        let searched = search::search(
+            &conn,
+            query,
+            "company",
+            None,
+            "agent:coordinator",
+            false,
+            10,
+        )
+        .unwrap();
+        let searched_lock_titles = searched
+            .iter()
+            .filter(|hit| hit.kind == "lock")
+            .map(|hit| hit.title.as_str())
+            .collect::<Vec<_>>();
+        assert!(!searched_lock_titles.is_empty());
+
+        let lines = context(&conn, "coordinator", query, Some(15)).unwrap();
+        for title in searched_lock_titles {
+            assert!(
+                lines.iter().any(|line| line.title == title),
+                "context dropped searched canonical lock {title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_recovers_each_bounded_semicolon_topic() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_lock_store_entry(
+            &conn,
+            "morning-brief-hygiene-sensor",
+            "Morning Brief Hygiene Sensor",
+            "Morning brief hygiene sensor detects stale approved decisions.",
+        );
+        insert_lock_store_entry(
+            &conn,
+            "ticket-frontmatter-validator",
+            "Ticket Frontmatter Validator",
+            "Ticket frontmatter validator is enforced by pre-commit.",
+        );
+        insert_lock_store_entry(
+            &conn,
+            "ticket-type-taxonomy",
+            "Ticket Type Taxonomy",
+            "Ticket type taxonomy keeps board grouping canonical.",
+        );
+        storage::rebuild_locks_fts(&conn).unwrap();
+
+        let lines = context(
+            &conn,
+            "coordinator",
+            "morning brief hygiene sensor; ticket frontmatter validator pre-commit; ticket type taxonomy",
+            Some(15),
+        )
+        .unwrap();
+        let titles = lines
+            .iter()
+            .map(|line| line.title.as_str())
+            .collect::<Vec<_>>();
+
+        for title in [
+            "Morning Brief Hygiene Sensor",
+            "Ticket Frontmatter Validator",
+            "Ticket Type Taxonomy",
+        ] {
+            assert!(titles.contains(&title), "missing topic result {title:?}");
+        }
+    }
+
+    #[test]
+    fn context_query_segmentation_is_bounded_and_preserves_single_topics() {
+        assert_eq!(context_ranking_queries("single topic"), ["single topic"]);
+        assert_eq!(
+            context_ranking_queries("alpha; beta / gamma — delta; ignored"),
+            [
+                "alpha; beta / gamma — delta; ignored",
+                "alpha",
+                "beta",
+                "gamma",
+            ]
+        );
     }
 
     #[test]
@@ -1554,9 +2596,9 @@ mod tests {
         schema::init_db(&conn).unwrap();
         insert_named_memory(
             &conn,
-            "actor-lanes",
-            "Actor Lanes",
-            "Operator decides. Curator routes. Builder executes.",
+            "role-boundaries",
+            "Role Boundaries",
+            "Maintainer approves. Coordinator routes. Builder executes.",
             true,
         );
         insert_lock_store_entry(
@@ -1573,7 +2615,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let strict = context(&conn, "curator", "fix a python test in notebook", Some(10)).unwrap();
+        let strict = context(
+            &conn,
+            "coordinator",
+            "fix a python test in catalog",
+            Some(10),
+        )
+        .unwrap();
         assert!(strict.iter().all(|line| line.title != "Borderline Testing"));
         assert!(strict.iter().any(|line| line.section == "nothing-specific"));
 
@@ -1582,7 +2630,13 @@ mod tests {
             [],
         )
         .unwrap();
-        let loose = context(&conn, "curator", "fix a python test in notebook", Some(10)).unwrap();
+        let loose = context(
+            &conn,
+            "coordinator",
+            "fix a python test in catalog",
+            Some(10),
+        )
+        .unwrap();
         assert!(loose.iter().any(|line| line.title == "Borderline Testing"));
     }
 
@@ -1592,9 +2646,9 @@ mod tests {
         schema::init_db(&conn).unwrap();
         insert_named_memory(
             &conn,
-            "actor-lanes",
-            "Actor Lanes",
-            "Operator decides. Curator routes. Builder executes.",
+            "role-boundaries",
+            "Role Boundaries",
+            "Maintainer approves. Coordinator routes. Builder executes.",
             true,
         );
         insert_named_memory(
@@ -1607,7 +2661,7 @@ mod tests {
         storage::log_recall_event(&conn, 2, "agent:engineer", "company").unwrap();
         storage::insert_future_item(&conn, "future task", "2026-06-13", "agent:engineer").unwrap();
 
-        let lines = context(&conn, "curator", "", Some(10)).unwrap();
+        let lines = context(&conn, "coordinator", "", Some(10)).unwrap();
 
         assert!(lines.iter().any(|line| line.title == "Generic Hot"));
         assert!(lines.iter().any(|line| line.section == "due-future"));
@@ -1618,7 +2672,7 @@ mod tests {
     fn context_floor_helper_branches_are_explicit() {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
-        let signal_terms = query_terms("fix a python test in notebook");
+        let signal_terms = query_terms("fix a python test in catalog");
         let dispatch_terms = query_terms("dispatch ticket");
         let plain_terms = query_terms("maintenance schedule");
 
@@ -1699,7 +2753,7 @@ mod tests {
         }
         let hot = hot_memory_lines(
             &conn,
-            "agent:curator",
+            "agent:coordinator",
             Some(&signal_terms),
             None,
             Some(DEFAULT_CONTEXT_RELEVANCE_FLOOR),
@@ -1733,7 +2787,7 @@ mod tests {
         assert_eq!(episodes[0].title, "Testing Episode");
 
         let context_with_future =
-            context(&conn, "curator", "maintenance schedule", Some(5)).unwrap();
+            context(&conn, "coordinator", "maintenance schedule", Some(5)).unwrap();
         assert!(
             context_with_future
                 .iter()
@@ -1782,7 +2836,7 @@ mod tests {
         let doc = MemoryDoc {
             name: "archivist-bootstrap".to_string(),
             title: "Archivist Bootstrap".to_string(),
-            body: "closing console ritual".to_string(),
+            body: "archive rotation ritual".to_string(),
             owner: "agent:archivist".to_string(),
             scope: "company".to_string(),
             source_path: Path::new("/tmp/archivist.md").to_path_buf(),

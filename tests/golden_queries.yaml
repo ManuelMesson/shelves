@@ -15,3 +15,13 @@ queries:
     scope: "os"
     expected_top3_contains:
       - "Closeout"
+  - miss_id: "synthetic-001"
+    query: "queue delta index migration"
+    scope: "company"
+    expected_top3_contains:
+      - "Delta Index Migration"
+  - miss_id: "synthetic-002"
+    query: "proof parity acl scope workflow"
+    scope: "company"
+    expected_top3_contains:
+      - "Proof Parity Audit"

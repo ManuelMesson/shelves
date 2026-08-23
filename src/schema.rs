@@ -86,9 +86,6 @@ CREATE TABLE IF NOT EXISTS node_acl (
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(title, body, content='memories', content_rowid='id');
 CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts USING fts5(summary, body, content='episodes', content_rowid='id');
 CREATE VIRTUAL TABLE IF NOT EXISTS locks_fts USING fts5(slug, title, body, content='locks', content_rowid='id');
-
-CREATE UNIQUE INDEX IF NOT EXISTS episodes_idempotency
-ON episodes(ts, actor, kind, summary, source_path);
 "#,
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
 
@@ -165,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn init_db_creates_base_tables_fts_tables_and_idempotency_index() {
+    fn init_db_creates_base_tables_and_fts_tables_without_legacy_episode_index() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
@@ -186,7 +183,7 @@ mod tests {
             assert!(names.contains(expected), "missing {expected}");
         }
 
-        let index_exists: i64 = conn
+        let legacy_index_exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'index' AND name = 'episodes_idempotency'",
@@ -194,7 +191,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(index_exists, 1);
+        assert_eq!(legacy_index_exists, 0);
     }
 
     #[test]
@@ -351,22 +348,26 @@ VALUES('shelves-testing-standard', 'Shelves Testing Standard', 'python pytest ca
     }
 
     #[test]
-    fn episodes_idempotency_index_deduplicates_insert_or_ignore_rows() {
+    fn fresh_schema_allows_same_timestamp_and_summary_when_body_changes() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        for _ in 0..2 {
-            conn.execute(
-                "INSERT OR IGNORE INTO episodes(ts, actor, kind, summary, body, scope, source_path)
-                 VALUES('2026-06-01T00:00:00Z', 'agent:engineer', 'note', 'summary', 'body', 'company', '/tmp/e.md')",
-                [],
-            )
-            .unwrap();
-        }
+        conn.execute(
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES('2026-06-01T00:00:00Z', 'agent:engineer', 'ticket', 'summary', 'body one', 'company', '/tmp/e.md')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
+             VALUES('2026-06-01T00:00:00Z', 'agent:engineer', 'ticket', 'summary', 'body two', 'company', '/tmp/e.md')",
+            [],
+        )
+        .unwrap();
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 }

@@ -174,11 +174,11 @@ pub fn promote(conn: &Connection, id: i64, to_scope: &str, by: &str) -> Result<P
     if !tier_allows(&memory.scope, to_scope, &by) {
         if by == "archivist" {
             bail!(
-                "archivist may nominate scope moves via consolidate; promote requires curator or operator"
+                "archivist may nominate scope moves via consolidate; promote requires coordinator or operator"
             );
         }
         bail!(
-            "{by} may not move memory {id} from {} to {to_scope}; product<->company requires curator, os/refusal overrides require operator",
+            "{by} may not move memory {id} from {} to {to_scope}; product<->company requires coordinator, os/refusal overrides require operator",
             memory.scope
         );
     }
@@ -329,7 +329,7 @@ fn required_tier(from_scope: &str, to_scope: Option<&str>, is_lock: bool) -> Str
     if is_lock || from_scope == "os" || to_scope == Some("os") {
         "operator".to_string()
     } else if from_scope.starts_with("product:") || from_scope == "company" {
-        "curator".to_string()
+        "coordinator".to_string()
     } else {
         "operator".to_string()
     }
@@ -339,7 +339,7 @@ fn tier_allows(from_scope: &str, to_scope: &str, by: &str) -> bool {
     if by == "operator" {
         return true;
     }
-    if by != "curator" {
+    if by != "coordinator" {
         return false;
     }
     (from_scope == "company" && to_scope.starts_with("product:"))
@@ -377,7 +377,7 @@ fn candidate(
 }
 
 fn write_report(report: &ConsolidationReport) -> Result<PathBuf> {
-    let dir = workspace_root()?.join("system/inbox/archivist-reports");
+    let dir = workspace_root()?.join("system/inbox/archive-reports");
     std::fs::create_dir_all(&dir)?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let path = dir.join(format!("{stamp}-shelves-consolidate.md"));
@@ -461,13 +461,13 @@ mod tests {
             &conn,
             "product-memory",
             "Product Memory",
-            "product:notebook",
+            "product:catalog",
             false,
         );
         insert_memory(&conn, "cold-memory", "Cold Memory", "company", false);
         insert_memory(&conn, "lock-memory", "Lock Memory", "company", true);
-        storage::log_recall_event(&conn, 1, "agent:curator", "company").unwrap();
-        storage::log_recall_event(&conn, 1, "agent:curator", "company").unwrap();
+        storage::log_recall_event(&conn, 1, "agent:coordinator", "company").unwrap();
+        storage::log_recall_event(&conn, 1, "agent:coordinator", "company").unwrap();
 
         let report = build_consolidation_report(&conn, false).unwrap();
 
@@ -503,10 +503,10 @@ mod tests {
             &conn,
             "product-memory",
             "Product Memory",
-            "product:notebook",
+            "product:catalog",
             false,
         );
-        storage::log_recall_event(&conn, 1, "agent:curator", "company").unwrap();
+        storage::log_recall_event(&conn, 1, "agent:coordinator", "company").unwrap();
 
         let report = build_consolidation_report(&conn, false).unwrap();
 
@@ -541,9 +541,9 @@ mod tests {
             title: "Pipe | Title\nNext".to_string(),
             name: "pipe-title".to_string(),
             owner: "shared".to_string(),
-            current_scope: "product:notebook".to_string(),
+            current_scope: "product:catalog".to_string(),
             suggested_scope: Some("company".to_string()),
-            required_tier: "curator".to_string(),
+            required_tier: "coordinator".to_string(),
             recall_counts_by_scope: counts,
             higher_scope_recall_count: 2,
             activation: Some(-0.25),
@@ -557,18 +557,18 @@ mod tests {
     }
 
     #[test]
-    fn promote_curator_allows_product_company_only_and_audits() {
+    fn promote_external_allows_product_company_only_and_audits() {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         insert_memory(
             &conn,
             "product-memory",
             "Product Memory",
-            "product:notebook",
+            "product:catalog",
             false,
         );
 
-        let outcome = promote(&conn, 1, "company", "curator").unwrap();
+        let outcome = promote(&conn, 1, "company", "coordinator").unwrap();
 
         assert!(outcome.changed);
         assert_eq!(outcome.owner, "shared");
@@ -593,17 +593,17 @@ mod tests {
             &conn,
             "product-memory",
             "Product Memory",
-            "product:notebook",
+            "product:catalog",
             false,
         );
         insert_memory(&conn, "company-memory", "Company Memory", "company", false);
         insert_memory(&conn, "os-memory", "OS Memory", "os", false);
 
         assert!(promote(&conn, 1, "company", "archivist").is_err());
-        assert!(promote(&conn, 1, "company", "curator").is_ok());
-        assert!(promote(&conn, 2, "os", "curator").is_err());
+        assert!(promote(&conn, 1, "company", "coordinator").is_ok());
+        assert!(promote(&conn, 2, "os", "coordinator").is_err());
         assert!(promote(&conn, 2, "os", "operator").is_ok());
-        assert!(promote(&conn, 3, "product:notebook", "operator").is_ok());
+        assert!(promote(&conn, 3, "product:catalog", "operator").is_ok());
     }
 
     #[test]
@@ -613,10 +613,10 @@ mod tests {
         insert_memory(&conn, "lock-memory", "Lock Memory", "company", true);
         insert_memory(&conn, "company-memory", "Company Memory", "company", false);
 
-        assert!(promote(&conn, 1, "product:notebook", "operator").is_err());
-        assert!(promote(&conn, 2, "personal", "operator").is_err());
-        let frontende = promote(&conn, 2, "company", "archivist").unwrap();
-        assert!(!frontende.changed);
+        assert!(promote(&conn, 1, "product:catalog", "operator").is_err());
+        assert!(promote(&conn, 2, "protected", "operator").is_err());
+        let same = promote(&conn, 2, "company", "archivist").unwrap();
+        assert!(!same.changed);
         let audits: i64 = conn
             .query_row("SELECT COUNT(*) FROM episodes", [], |row| row.get(0))
             .unwrap();
@@ -632,25 +632,25 @@ mod tests {
         counts.insert("os".to_string(), 1);
         counts.insert("company".to_string(), 2);
 
-        assert_eq!(higher_scope_count("product:notebook", &counts), 3);
+        assert_eq!(higher_scope_count("product:catalog", &counts), 3);
         assert_eq!(
-            suggested_scope("product:notebook", &counts),
+            suggested_scope("product:catalog", &counts),
             Some("company".to_string())
         );
         assert_eq!(suggested_scope("company", &counts), Some("os".to_string()));
         assert_eq!(normalize_broader_scope("os"), "os");
         assert_eq!(normalize_broader_scope("company"), "company");
         assert_eq!(
-            required_tier("company", Some("product:notebook"), false),
-            "curator"
+            required_tier("company", Some("product:catalog"), false),
+            "coordinator"
         );
         assert_eq!(required_tier("company", Some("os"), false), "operator");
         assert_eq!(
-            required_tier("personal", Some("company"), false),
+            required_tier("protected", Some("company"), false),
             "operator"
         );
-        assert!(tier_allows("company", "product:notebook", "curator"));
-        assert!(!tier_allows("company", "os", "curator"));
+        assert!(tier_allows("company", "product:catalog", "coordinator"));
+        assert!(!tier_allows("company", "os", "coordinator"));
         assert_eq!(kind_order("unknown"), 3);
     }
 
@@ -672,10 +672,10 @@ mod tests {
 
     proptest! {
         #[test]
-        fn promote_does_not_mutate_owner_or_non_target_rows(to_scope in "(os|company|product:[a-z][a-z0-9-]{0,12})", by in "(curator|operator|archivist|engineer)") {
+        fn promote_does_not_mutate_owner_or_non_target_rows(to_scope in "(os|company|product:[a-z][a-z0-9-]{0,12})", by in "(coordinator|operator|archivist|engineer)") {
             let conn = Connection::open_in_memory().unwrap();
             schema::init_db(&conn).unwrap();
-            insert_memory(&conn, "target", "Target", "product:notebook", false);
+            insert_memory(&conn, "target", "Target", "product:catalog", false);
             insert_memory(&conn, "other", "Other", "company", false);
             let _ = promote(&conn, 1, &to_scope, &by);
             let target_owner: String = conn.query_row("SELECT owner FROM memories WHERE id=1", [], |row| row.get(0)).unwrap();

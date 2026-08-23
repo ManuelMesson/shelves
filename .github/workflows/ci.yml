@@ -1,0 +1,53 @@
+name: Shelves gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: format, lint, tests, audit, public-content
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Use pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt
+          rustup override set 1.96.0
+          rustup show active-toolchain
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned Python gates
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Rust format
+        run: ./scripts/check.sh format
+
+      - name: Clippy
+        run: ./scripts/check.sh clippy
+
+      - name: Rust tests
+        run: ./scripts/check.sh rust-tests
+
+      - name: Python lint and tests
+        run: ./scripts/check.sh python
+
+      - name: Dependency audit
+        run: ./scripts/check.sh audit
+
+      - name: Public content and path guard
+        run: ./scripts/check.sh public-content
