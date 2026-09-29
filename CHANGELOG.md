@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 0.5.0 candidate
+## 0.5.0 — 2026-09-29
 
 - Add explicit row visibility, private grants, grant audit, and read filtering
   across query and report surfaces. Unmarked rows remain shared by default.
