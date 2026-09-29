@@ -2,9 +2,16 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Shelves is a local-first, LLM-free memory engine for multi-agent workspaces. It
-derives a rebuildable SQLite/FTS index from canonical Markdown, then returns
-bounded context packs ranked by keyword relevance and activation.
+Shelves gives a team of AI agents a shared memory of what was decided: the
+rules, the roles, and who owns what, kept in plain Markdown files you own.
+The author's own multi-agent workspace runs on it every day; this repository
+is the engine, shared under MIT. It is built for one trusted local workspace:
+read rules trust the identity the caller states, so it is not a security
+boundary between people.
+
+Under the hood, Shelves is a local-first, LLM-free memory engine. It derives a
+rebuildable SQLite/FTS index from canonical Markdown, then returns bounded
+context packs ranked by keyword relevance and activation.
 
 It does not call a model, require embeddings, or replace canonical source
 files. The CLI and schema operate on paths, strings, and SQLite, so callers are
@@ -98,8 +105,7 @@ PATH="$PWD/.venv/bin:$PATH" ./scripts/check.sh
 The last line is the single repository gate. It runs format, Clippy with
 warnings denied, all Rust tests, Ruff, Python tests, the public-content/path
 guard, and `cargo audit`. The workflow in `.github/workflows/ci.yml` invokes
-the same checks on GitHub-hosted runners. Run status depends on GitHub Actions
-availability for the repository.
+the same checks on GitHub-hosted runners.
 
 ## Configuration
 
@@ -119,4 +125,4 @@ availability for the repository.
 
 ## License
 
-MIT © 2026 Manuel Messon-Roque
+MIT © 2026 Manuel Messon-Roque. Free to use, change, and share.
