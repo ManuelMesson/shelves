@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -15,6 +15,7 @@ pub struct SearchHit {
     pub snippet: String,
     pub owner: String,
     pub scope: String,
+    pub memory_type: String,
     pub is_lock: i64,
     pub status: String,
     pub source_path: String,
@@ -99,6 +100,7 @@ fn search_prepared(
                 &fts_query.expression,
                 search_scope,
                 scope_index,
+                as_agent,
                 limit,
             )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
@@ -109,7 +111,8 @@ fn search_prepared(
         }
     }
     let episode_weight = rank_episode_weight(conn)?;
-    let mut ranked_hits = rank_hits(raw_hits, episode_weight);
+    let reference_weight = rank_reference_weight(conn)?;
+    let mut ranked_hits = rank_hits(raw_hits, episode_weight, reference_weight);
     ranked_hits.sort_by(|a, b| {
         a.hit
             .rank
@@ -165,7 +168,7 @@ pub fn memory_relevance_scores(
             break;
         }
     }
-    let ranked_hits = rank_hits(raw_hits, 1.0);
+    let ranked_hits = rank_hits(raw_hits, 1.0, 1.0);
     let mut scores = HashMap::new();
     for ranked in ranked_hits {
         let score = -ranked.hit.rank;
@@ -175,6 +178,35 @@ pub fn memory_relevance_scores(
             .or_insert(score);
     }
     Ok(scores)
+}
+
+pub fn withheld_private_count(conn: &Connection, query: &str, reader: &str) -> Result<usize> {
+    let mut ids = HashSet::new();
+    for fts_query in fts_queries(query) {
+        let mut stmt = conn.prepare(
+            "SELECT m.id FROM memories_fts JOIN memories m ON m.id=memories_fts.rowid
+             WHERE memories_fts MATCH ?1 AND m.status != 'archived'",
+        )?; // LCOV_EXCL_LINE: successful FTS prepare asserted by withheld-count golden.
+        let rows = stmt.query_map(params![fts_query.expression], |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            let id = row?;
+            if acl::private_row_withheld(conn, "memory", id, reader)? {
+                ids.insert(("memory", id));
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT e.id FROM episodes_fts JOIN episodes e ON e.id=episodes_fts.rowid
+             WHERE episodes_fts MATCH ?1 AND e.kind != 'miss'",
+        )?; // LCOV_EXCL_LINE: successful episode FTS prepare asserted by withheld-count golden.
+        let rows = stmt.query_map(params![fts_query.expression], |row| row.get::<_, i64>(0))?;
+        for row in rows {
+            let id = row?;
+            if acl::private_row_withheld(conn, "episode", id, reader)? {
+                ids.insert(("episode", id));
+            }
+        }
+    }
+    Ok(ids.len())
 }
 
 pub fn lock_relevance_scores(
@@ -207,7 +239,7 @@ pub fn lock_relevance_scores(
             break;
         }
     }
-    let ranked_hits = rank_hits(raw_hits, 1.0);
+    let ranked_hits = rank_hits(raw_hits, 1.0, 1.0);
     let mut scores = HashMap::new();
     for ranked in ranked_hits {
         let score = -ranked.hit.rank;
@@ -273,6 +305,7 @@ fn search_locks(
                     snippet: row.get(3)?,
                     owner: "shared".to_string(),
                     scope: row.get(4)?,
+                    memory_type: "lock".to_string(),
                     is_lock: 1,
                     status: "active".to_string(),
                     source_path: source_path.clone(),
@@ -299,7 +332,7 @@ fn search_memories(
     limit: usize,
 ) -> Result<Vec<RawSearchHit>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.name, m.title, substr(m.body, 1, 300), m.owner, m.scope, m.is_lock, m.status, coalesce(m.source_path, ''), bm25(memories_fts, 5.0, 1.0) AS rank, m.body
+        "SELECT m.id, m.name, m.title, substr(m.body, 1, 300), m.owner, m.scope, m.memory_type, m.is_lock, m.status, coalesce(m.source_path, ''), bm25(memories_fts, 5.0, 1.0) AS rank, m.body
          FROM memories_fts
          JOIN memories m ON m.id = memories_fts.rowid
          WHERE memories_fts MATCH ?1
@@ -319,10 +352,10 @@ fn search_memories(
             scope.contains('%')
         ],
         |row| {
-            let raw_rank = row.get(9)?;
+            let raw_rank = row.get(10)?;
             let name = row.get::<_, String>(1)?;
             let title = row.get::<_, String>(2)?;
-            let body = row.get::<_, String>(10)?;
+            let body = row.get::<_, String>(11)?;
             Ok(RawSearchHit {
                 raw_rank,
                 scope_index,
@@ -335,9 +368,10 @@ fn search_memories(
                     snippet: row.get(3)?,
                     owner: row.get(4)?,
                     scope: row.get(5)?,
-                    is_lock: row.get(6)?,
-                    status: row.get(7)?,
-                    source_path: row.get(8)?,
+                    memory_type: row.get(6)?,
+                    is_lock: row.get(7)?,
+                    status: row.get(8)?,
+                    source_path: row.get(9)?,
                     rank: raw_rank,
                 },
             })
@@ -347,7 +381,7 @@ fn search_memories(
     let mut hits = Vec::new();
     for row in rows {
         let hit = row?;
-        if acl::can_read_owner(conn, &hit.hit.owner, as_agent)? {
+        if acl::can_read_row(conn, "memory", hit.hit.id, as_agent)? {
             hits.push(hit);
         }
     }
@@ -359,6 +393,7 @@ fn search_episodes(
     fts_query: &str,
     scope: &str,
     scope_index: usize,
+    as_agent: &str,
     limit: usize,
 ) -> Result<Vec<RawSearchHit>> {
     let mut stmt = conn.prepare(
@@ -387,6 +422,7 @@ fn search_episodes(
                     snippet: row.get(2)?,
                     owner: row.get(3)?,
                     scope: row.get(4)?,
+                    memory_type: "episode".to_string(),
                     is_lock: 0,
                     status: String::new(),
                     source_path: row.get(5)?,
@@ -395,8 +431,14 @@ fn search_episodes(
             })
         },
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut hits = Vec::new();
+    for row in rows {
+        let hit = row?;
+        if acl::can_read_row(conn, "episode", hit.hit.id, as_agent)? {
+            hits.push(hit);
+        }
+    }
+    Ok(hits)
 }
 
 fn rank_episode_weight(conn: &Connection) -> Result<f64> {
@@ -411,6 +453,20 @@ fn rank_episode_weight(conn: &Connection) -> Result<f64> {
         .and_then(|raw| raw.parse::<f64>().ok())
         .filter(|weight| *weight > 0.0 && *weight <= 1.0)
         .unwrap_or(0.55))
+}
+
+fn rank_reference_weight(conn: &Connection) -> Result<f64> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='rank_reference_weight'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|weight| *weight >= 1.0 && *weight <= 2.0)
+        .unwrap_or(1.08))
 }
 
 fn real_match_floor(conn: &Connection) -> Result<f64> {
@@ -471,7 +527,11 @@ fn real_match_stats(search_text: &str, terms: &[String]) -> (usize, f64) {
     (matched, matched as f64 / terms.len() as f64)
 }
 
-fn rank_hits(raw_hits: Vec<RawSearchHit>, episode_weight: f64) -> Vec<RawSearchHit> {
+fn rank_hits(
+    raw_hits: Vec<RawSearchHit>,
+    episode_weight: f64,
+    reference_weight: f64,
+) -> Vec<RawSearchHit> {
     let max_memory_score = max_abs_rank(&raw_hits, "memory");
     let max_lock_score = max_abs_rank(&raw_hits, "lock");
     let max_episode_score = max_abs_rank(&raw_hits, "episode");
@@ -488,10 +548,10 @@ fn rank_hits(raw_hits: Vec<RawSearchHit>, episode_weight: f64) -> Vec<RawSearchH
             } else {
                 0.0 // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
             };
-            let kind_weight = if raw.hit.kind == "episode" {
-                episode_weight
-            } else {
-                1.0
+            let kind_weight = match (raw.hit.kind.as_str(), raw.hit.memory_type.as_str()) {
+                ("episode", _) => episode_weight,
+                ("memory", "reference") => reference_weight,
+                _ => 1.0,
             };
             raw.hit.rank = -(normalized * kind_weight);
             raw
@@ -516,27 +576,36 @@ fn kind_order(kind: &str) -> u8 {
 }
 
 fn fts_queries(query: &str) -> Vec<FtsQuery> {
+    let original_terms = unsplit_query_terms(query);
     let mut terms: Vec<String> = Vec::new();
-    for term in query
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|term| term.len() >= 2 && !is_query_stopword(term))
-        .take(8)
-        .map(|term| term.to_ascii_lowercase())
-    {
+    for term in query_terms(query).into_iter().take(8) {
         if !terms.contains(&term) {
             terms.push(term);
         }
     }
+    let mut queries = Vec::new();
+    if original_terms != terms && !original_terms.is_empty() {
+        let expression = original_terms
+            .iter()
+            .map(|term| format!("{term}*"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        queries.push(FtsQuery {
+            expression,
+            terms: original_terms,
+        });
+    }
     if terms.is_empty() {
-        Vec::new()
+        queries
     } else if terms.len() == 1 {
-        vec![FtsQuery {
+        queries.push(FtsQuery {
             expression: format!("{}*", terms[0]),
             terms,
-        }]
+        });
+        queries
     } else {
         let fts_terms: Vec<String> = terms.iter().map(|term| format!("{term}*")).collect();
-        vec![
+        queries.extend([
             FtsQuery {
                 expression: fts_terms.join(" "),
                 terms: terms.clone(),
@@ -545,8 +614,45 @@ fn fts_queries(query: &str) -> Vec<FtsQuery> {
                 expression: fts_terms.join(" OR "),
                 terms,
             },
-        ]
+        ]);
+        queries
     }
+}
+
+fn unsplit_query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 2 && !is_query_stopword(term))
+        .take(8)
+        .map(|term| term.to_ascii_lowercase())
+        .collect()
+}
+
+pub(crate) fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .flat_map(split_identifier)
+        .filter(|term| term.len() >= 2 && !is_query_stopword(term))
+        .map(|term| term.to_ascii_lowercase())
+        .collect()
+}
+
+fn split_identifier(term: &str) -> Vec<&str> {
+    let mut starts = vec![0];
+    let chars = term.char_indices().collect::<Vec<_>>();
+    for window in chars.windows(2) {
+        let (_, previous) = window[0];
+        let (index, current) = window[1];
+        if previous.is_ascii_lowercase() && current.is_ascii_uppercase() {
+            starts.push(index);
+        }
+    }
+    starts.push(term.len());
+    starts
+        .windows(2)
+        .filter_map(|bounds| term.get(bounds[0]..bounds[1]))
+        .collect()
 }
 
 pub fn is_query_stopword(term: &str) -> bool {
@@ -603,6 +709,8 @@ mod tests {
             body: "A great guide knows your name and walks you through.".to_string(),
             owner: "shared".to_string(),
             scope: "company".to_string(),
+            memory_type: "memory".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/memory.md").to_path_buf(),
             content_hash: "hash".to_string(),
             is_lock: false,
@@ -689,6 +797,8 @@ mod tests {
                 body: "python pytest rust cargo golden coverage".to_string(),
                 owner: "shared".to_string(),
                 scope: "company".to_string(),
+                memory_type: "memory".to_string(),
+                visibility: None,
                 source_path: Path::new("/tmp/memory.md").to_path_buf(),
                 content_hash: "hash-shelves".to_string(),
                 is_lock: true,
@@ -779,6 +889,41 @@ mod tests {
             expressions("what was done yesterday"),
             ["done* yesterday*", "done* OR yesterday*"]
         );
+        assert_eq!(
+            query_terms("VendorDbService.query AgentChat hostingPermissions"),
+            [
+                "vendor",
+                "db",
+                "service",
+                "query",
+                "agent",
+                "chat",
+                "hosting",
+                "permissions"
+            ]
+        );
+        assert_eq!(
+            expressions("hostingPermissions"),
+            [
+                "hostingpermissions*",
+                "hosting* permissions*",
+                "hosting* OR permissions*"
+            ]
+        );
+    }
+
+    #[test]
+    fn relevant_reference_memory_gets_a_small_rank_advantage() {
+        let mut normal = raw_hit("memory", 1, -10.0, 0);
+        normal.hit.memory_type = "memory".to_string();
+        let mut reference = raw_hit("memory", 2, -10.0, 0);
+        reference.hit.memory_type = "reference".to_string();
+
+        let mut hits = rank_hits(vec![normal, reference], 0.55, 1.08);
+        hits.sort_by(|left, right| left.hit.rank.total_cmp(&right.hit.rank));
+
+        assert_eq!(hits[0].hit.id, 2);
+        assert_eq!(hits[0].hit.rank, -1.08);
     }
 
     #[test]
@@ -889,6 +1034,7 @@ mod tests {
                 raw_hit("episode", 2, -100.0, 0),
             ],
             0.55,
+            1.08,
         );
 
         let memory = hits.iter().find(|hit| hit.hit.kind == "memory").unwrap();
@@ -919,6 +1065,7 @@ mod tests {
             body: "worker dispatch pattern worker dispatch pattern worker dispatch pattern"
                 .to_string(),
             scope: "os".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/noise.md").to_path_buf(),
         };
         storage::insert_episode_if_new(&conn, &noisy_episode).unwrap();
@@ -963,6 +1110,7 @@ mod tests {
             summary: "secret needle episode".to_string(),
             body: "secret needle episode body".to_string(),
             scope: "company".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/episode.md").to_path_buf(),
         };
         storage::insert_episode_if_new(&conn, &episode).unwrap();
@@ -1066,6 +1214,8 @@ mod tests {
             body: body.to_string(),
             owner: "shared".to_string(),
             scope: scope.to_string(),
+            memory_type: "memory".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/memory.md").to_path_buf(),
             content_hash: format!("hash-{name}"),
             is_lock: false,
@@ -1087,6 +1237,11 @@ mod tests {
                 snippet: String::new(),
                 owner: "shared".to_string(),
                 scope: "os".to_string(),
+                memory_type: if kind == "memory" {
+                    "memory".to_string()
+                } else {
+                    kind.to_string()
+                },
                 is_lock: 0,
                 status: "hot".to_string(),
                 source_path: String::new(),

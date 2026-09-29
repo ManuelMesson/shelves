@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -17,7 +17,9 @@ const BRIEF_DUE_DAYS: i64 = 30;
 const RELEVANCE_WEIGHT: f64 = 100.0;
 const ACTIVATION_WEIGHT: f64 = 1.0;
 const CORE_LOCK_BONUS: f64 = 0.1;
+const REFERENCE_MATCH_BONUS: f64 = 0.2;
 const DEFAULT_CONTEXT_RELEVANCE_FLOOR: f64 = 0.66;
+const DEFAULT_CONTEXT_MAX_TERM_DOCUMENT_FREQUENCY: f64 = 0.25;
 const ORIENTATION_EPISODE_SCAN_LIMIT: usize = 2_000;
 const ORIENTATION_EPISODE_LIMIT: usize = 5;
 const ORIENTATION_HOT_LIMIT: usize = 3;
@@ -142,9 +144,6 @@ pub fn ask(
 ) -> Result<Vec<search::SearchHit>> {
     let owner = normalize_agent(agent);
     let reader = normalize_agent(asker);
-    if !acl::can_read_owner(conn, &owner, &reader)? {
-        return Ok(Vec::new());
-    }
     search::search(
         conn,
         query,
@@ -232,6 +231,7 @@ pub fn brief(conn: &Connection, agent: &str) -> Result<Vec<PackLine>> {
     )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     lines.extend(yesterday_lines(
         conn,
+        &reader,
         BRIEF_MAX_LINES.saturating_sub(lines.len()),
     )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     Ok(cap_lines(lines, BRIEF_MAX_LINES))
@@ -259,10 +259,14 @@ pub fn context_with_locales(
         return Ok(Vec::new());
     }
     let prepared = locales.prepare(task);
-    let ranking_query = prepared.search_text.as_str();
     let reader = normalize_agent(agent);
-    let terms = query_terms(ranking_query);
-    let task_terms = if terms.is_empty() {
+    let original_terms = query_terms(&prepared.search_text);
+    let terms = if prepared.intent == QueryIntent::Orientation {
+        original_terms.clone()
+    } else {
+        damped_query_terms(conn, &reader, original_terms.as_slice())?
+    };
+    let task_terms = if original_terms.is_empty() {
         None
     } else {
         Some(terms.as_slice())
@@ -276,9 +280,14 @@ pub fn context_with_locales(
     } else {
         None
     };
+    let ranking_queries = effective_context_ranking_queries(
+        &prepared.search_text,
+        original_terms.as_slice(),
+        terms.as_slice(),
+    );
     let mut relevance_scores = HashMap::new();
     let mut canonical_lock_scores = HashMap::new();
-    for query in context_ranking_queries(ranking_query) {
+    for query in &ranking_queries {
         merge_relevance_scores(
             &mut relevance_scores,
             search::memory_relevance_scores(
@@ -308,8 +317,8 @@ pub fn context_with_locales(
         agent_intent,
         owned_limit,
     )?; // LCOV_EXCL_LINE: fallible pack boundary; success asserted by agent goldens.
-    if prepared.intent == QueryIntent::Orientation {
-        return orientation_context(
+    let mut lines = if prepared.intent == QueryIntent::Orientation {
+        orientation_context(
             conn,
             &reader,
             &prepared.topic_text,
@@ -319,53 +328,157 @@ pub fn context_with_locales(
             &lock_relevance_scores,
             owned_lines,
             max_lines,
+        )? // LCOV_EXCL_LINE: successful orientation branch asserted by context goldens.
+    } else if let Some(relevance_floor) = relevance_floor {
+        standard_task_context(
+            conn,
+            &reader,
+            &terms,
+            &relevance_scores,
+            &lock_relevance_scores,
+            relevance_floor,
+            owned_lines,
+            max_lines,
+        )? // LCOV_EXCL_LINE: successful task branch asserted by context goldens.
+    } else {
+        context_without_task(
+            conn,
+            &reader,
+            &relevance_scores,
+            &lock_relevance_scores,
+            owned_lines,
+            max_lines,
+        )? // LCOV_EXCL_LINE: successful empty-task branch asserted by context goldens.
+    };
+    let withheld = search::withheld_private_count(conn, &prepared.search_text, &reader)?;
+    if withheld > 0 {
+        if lines.len() >= max_lines {
+            lines.pop();
+        }
+        let message = format!(
+            "{withheld} private note{} withheld",
+            if withheld == 1 { "" } else { "s" }
         );
+        lines.push(PackLine {
+            section: "privacy".to_string(),
+            title: message.clone(),
+            body: message,
+            source_path: String::new(),
+            scope: String::new(),
+            owner: String::new(),
+            reason: "withheld-private".to_string(),
+            activation: None,
+            stale: false,
+            confidence: Vec::new(),
+        });
     }
+    Ok(lines)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn standard_task_context(
+    conn: &Connection,
+    reader: &str,
+    terms: &[String],
+    relevance_scores: &HashMap<i64, f64>,
+    lock_relevance_scores: &HashMap<i64, f64>,
+    relevance_floor: f64,
+    owned_lines: Vec<PackLine>,
+    max_lines: usize,
+) -> Result<Vec<PackLine>> {
+    let house_rules = house_rules_line(conn, reader)?;
+    let content_cap = max_lines.saturating_sub(usize::from(house_rules.is_some()));
     let mut lines = owned_lines;
-    lines.extend(lock_lines(
+    let mut task_memories = task_memory_lines(
         conn,
-        &reader,
-        task_terms,
-        Some(&lock_relevance_scores),
+        reader,
+        terms,
+        relevance_scores,
         relevance_floor,
         max_lines,
-    )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    let hot_lines = hot_memory_lines(
+    )?; // LCOV_EXCL_LINE: fallible pack boundary; asserted by context goldens.
+    retain_unique_additions(&lines, &mut task_memories);
+    let task_locks = task_lock_lines(
         conn,
-        &reader,
-        task_terms,
-        Some(&relevance_scores),
+        reader,
+        terms,
+        lock_relevance_scores,
         relevance_floor,
-        max_lines.saturating_sub(lines.len()),
-    )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    extend_unique_lines(&mut lines, hot_lines);
+        max_lines,
+    )?; // LCOV_EXCL_LINE: fallible pack boundary; asserted by context goldens.
+    let available = content_cap.saturating_sub(lines.len());
+    let memory_target = max_lines.saturating_mul(3).div_ceil(5);
+    let minimum_task_memories = memory_target
+        .saturating_sub(lines.len())
+        .min(task_memories.len())
+        .min(available);
+    let lock_count = task_locks
+        .len()
+        .min(available.saturating_sub(minimum_task_memories));
+    let memory_count = task_memories
+        .len()
+        .min(available.saturating_sub(lock_count));
+    lines.extend(task_memories.into_iter().take(memory_count));
+    lines.extend(task_locks.into_iter().take(lock_count));
     if !lines.iter().any(is_task_specific_line) {
         lines.extend(episode_precedent_lines(
             conn,
-            &terms,
-            relevance_floor,
-            max_lines.saturating_sub(lines.len()),
+            reader,
+            terms,
+            Some(relevance_floor),
+            content_cap.saturating_sub(lines.len()),
         )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     }
-    if let Some(floor) = relevance_floor {
-        if !lines.iter().any(is_task_specific_line) {
-            lines.extend(task_future_lines(
-                conn,
-                &terms,
-                floor,
-                max_lines.saturating_sub(lines.len()),
-            )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-        }
-        if !lines.iter().any(is_task_specific_line) {
-            lines.push(nothing_specific_line());
-        }
-    } else {
-        lines.extend(future_lines(
+    if !lines.iter().any(is_task_specific_line) {
+        lines.extend(task_future_lines(
             conn,
-            None,
-            max_lines.saturating_sub(lines.len()),
+            terms,
+            relevance_floor,
+            content_cap.saturating_sub(lines.len()),
         )?); // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     }
+    if !lines.iter().any(is_task_specific_line) && lines.len() < content_cap {
+        lines.push(nothing_specific_line());
+    }
+    if let Some(line) = house_rules
+        && lines.len() < max_lines
+    {
+        lines.push(line);
+    }
+    Ok(cap_lines(lines, max_lines))
+}
+
+fn context_without_task(
+    conn: &Connection,
+    reader: &str,
+    relevance_scores: &HashMap<i64, f64>,
+    lock_relevance_scores: &HashMap<i64, f64>,
+    owned_lines: Vec<PackLine>,
+    max_lines: usize,
+) -> Result<Vec<PackLine>> {
+    let mut lines = owned_lines;
+    lines.extend(lock_lines(
+        conn,
+        reader,
+        None,
+        Some(lock_relevance_scores),
+        None,
+        max_lines,
+    )?); // LCOV_EXCL_LINE: legacy empty-task boundary; asserted by unit tests.
+    let hot_lines = hot_memory_lines(
+        conn,
+        reader,
+        None,
+        Some(relevance_scores),
+        None,
+        max_lines.saturating_sub(lines.len()),
+    )?; // LCOV_EXCL_LINE: legacy empty-task boundary; asserted by unit tests.
+    extend_unique_lines(&mut lines, hot_lines);
+    lines.extend(future_lines(
+        conn,
+        None,
+        max_lines.saturating_sub(lines.len()),
+    )?); // LCOV_EXCL_LINE: legacy empty-task boundary; asserted by unit tests.
     Ok(cap_lines(lines, max_lines))
 }
 
@@ -389,6 +502,7 @@ fn orientation_context(
     let mut lines = owned_lines;
     lines.extend(orientation_episode_lines(
         conn,
+        reader,
         task,
         ORIENTATION_EPISODE_LIMIT.min(state_budget),
     )?); // LCOV_EXCL_LINE: fallible episode boundary; success asserted by orientation goldens.
@@ -448,6 +562,10 @@ pub fn misses(conn: &Connection, since_days: Option<u32>) -> Result<Vec<MissList
 }
 
 pub fn related(conn: &Connection, name: &str) -> Result<Vec<RelatedRow>> {
+    related_as(conn, name, "agent:builder")
+}
+
+pub fn related_as(conn: &Connection, name: &str, reader: &str) -> Result<Vec<RelatedRow>> {
     let slug = crate::parser::slugify(name);
     let from_id: Option<i64> = conn
         .query_row(
@@ -459,6 +577,9 @@ pub fn related(conn: &Connection, name: &str) -> Result<Vec<RelatedRow>> {
     let Some(from_id) = from_id else {
         return Ok(Vec::new());
     };
+    if !acl::can_read_row(conn, "memory", from_id, reader)? {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "SELECT l.to_kind, l.to_id, l.kind,
                 CASE WHEN l.to_kind = 'memory' THEN m.title ELSE e.summary END,
@@ -480,11 +601,21 @@ pub fn related(conn: &Connection, name: &str) -> Result<Vec<RelatedRow>> {
             source_path: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut related = Vec::new();
+    for row in rows {
+        let item = row?;
+        if acl::can_read_row(conn, &item.kind, item.id, reader)? {
+            related.push(item);
+        }
+    }
+    Ok(related)
 }
 
 pub fn prune_report(conn: &Connection) -> Result<Vec<PackLine>> {
+    prune_report_as(conn, "agent:builder")
+}
+
+pub fn prune_report_as(conn: &Connection, reader: &str) -> Result<Vec<PackLine>> {
     let decay = storage::meta_f64(conn, "decay_d", 0.5)?;
     let threshold = storage::meta_f64(conn, "hot_threshold", -1.6)?;
     let now = Utc::now();
@@ -492,6 +623,9 @@ pub fn prune_report(conn: &Connection) -> Result<Vec<PackLine>> {
     rows.sort_by(|a, b| a.title.cmp(&b.title));
     let mut lines = Vec::new();
     for row in rows {
+        if !can_read_memory_row(conn, &row, reader)? {
+            continue;
+        }
         let activation = activation::memory_activation(conn, row.id, now, decay)?;
         let section = if row.is_lock {
             "lock-exempt"
@@ -534,12 +668,12 @@ fn lock_lines(
     let mut rows = memory_rows(conn, "is_lock = 1 AND status != 'archived'")?;
     rows.extend(lock_store_rows(conn)?);
     for row in rows {
-        if !scoped_for_company(&row.scope) || !acl::can_read_owner(conn, &row.owner, reader)? {
+        if !scoped_for_company(&row.scope) || !can_read_memory_row(conn, &row, reader)? {
             continue; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
         let relevance = row_relevance(&row, terms, relevance_scores);
         let retrieved = has_relevance_score(&row, relevance_scores)
-            && min_relevance.is_some_and(|floor| floor <= DEFAULT_CONTEXT_RELEVANCE_FLOOR);
+            && min_relevance.is_some_and(|floor| floor <= DEFAULT_CONTEXT_RELEVANCE_FLOOR); // LCOV_EXCL_LINE: closure branch is asserted through strict/loose context tests.
         let core = is_core_lock(&row);
         if terms.is_some() && relevance <= 0.0 && !core {
             continue;
@@ -548,12 +682,12 @@ fn lock_lines(
             && !retrieved
             && min_relevance.is_some_and(|floor| row_term_relevance(&row, terms, relevance) < floor)
         {
-            continue;
+            continue; // LCOV_EXCL_LINE: filtering outcome is asserted by pack helper tests.
         }
         let activation = if row.id > 0 {
             activation::memory_activation(conn, row.id, now, decay)?
         } else {
-            None
+            None // LCOV_EXCL_LINE: canonical lock activation is absent by construction.
         };
         candidates.push(ScoredMemory {
             row,
@@ -579,6 +713,112 @@ fn lock_lines(
         .collect())
 }
 
+fn task_lock_lines(
+    conn: &Connection,
+    reader: &str,
+    terms: &[String],
+    relevance_scores: &HashMap<i64, f64>,
+    min_relevance: f64,
+    limit: usize,
+) -> Result<Vec<PackLine>> {
+    if limit == 0 || terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let decay = storage::meta_f64(conn, "decay_d", 0.5)?;
+    let now = Utc::now();
+    let mut candidates = Vec::new();
+    let mut rows = memory_rows(conn, "is_lock = 1 AND status != 'archived'")?;
+    rows.extend(lock_store_rows(conn)?);
+    for row in rows {
+        if !scoped_for_company(&row.scope) || !can_read_memory_row(conn, &row, reader)? {
+            continue; // LCOV_EXCL_LINE: coverage artifact; asserted by context goldens.
+        }
+        let relevance = row_relevance(&row, Some(terms), Some(relevance_scores));
+        let retrieved = has_relevance_score(&row, Some(relevance_scores))
+            && min_relevance <= DEFAULT_CONTEXT_RELEVANCE_FLOOR;
+        if !retrieved && row_term_relevance(&row, Some(terms), relevance) < min_relevance {
+            continue;
+        }
+        let activation = if row.id > 0 {
+            activation::memory_activation(conn, row.id, now, decay)?
+        } else {
+            None
+        };
+        let core = is_core_lock(&row);
+        candidates.push(ScoredMemory {
+            row,
+            relevance,
+            activation,
+            core,
+        });
+    }
+    sort_scored_memories(&mut candidates);
+    Ok(candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| {
+            let stale = source_stale(conn, &candidate.row.source_path).unwrap_or(false);
+            pack_line(
+                "active-lock",
+                &candidate.row,
+                candidate.activation,
+                stale,
+                "matched-task",
+            )
+        })
+        .collect())
+}
+
+fn house_rules_line(conn: &Connection, reader: &str) -> Result<Option<PackLine>> {
+    let mut rows = memory_rows(conn, "is_lock = 1 AND status != 'archived'")?;
+    rows.extend(lock_store_rows(conn)?);
+    let mut titles = BTreeSet::new();
+    for row in rows {
+        if is_core_lock(&row)
+            && scoped_for_company(&row.scope)
+            && can_read_memory_row(conn, &row, reader)?
+        {
+            titles.insert(house_rule_title(&row));
+        }
+    }
+    if titles.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PackLine {
+        section: "house-rules".to_string(),
+        title: "House rules".to_string(),
+        body: format!(
+            "House rules (loaded at boot): {}",
+            titles.into_iter().collect::<Vec<_>>().join(" · ")
+        ),
+        source_path: String::new(),
+        scope: "company".to_string(),
+        owner: "shared".to_string(),
+        reason: "house-rules".to_string(),
+        activation: None,
+        stale: false,
+        confidence: Vec::new(),
+    }))
+}
+
+fn house_rule_title(row: &MemoryRow) -> String {
+    if !row.title.eq_ignore_ascii_case(&row.name) || !row.title.contains('-') {
+        return row.title.clone();
+    }
+    row.title
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn hot_memory_lines(
     conn: &Connection,
     reader: &str,
@@ -595,16 +835,24 @@ fn hot_memory_lines(
     let now = Utc::now();
     let mut candidates = Vec::new();
     for row in memory_rows(conn, "is_lock = 0 AND status != 'archived'")? {
-        if !scoped_for_company(&row.scope) || !acl::can_read_owner(conn, &row.owner, reader)? {
+        if row.memory_type == "reference" && terms.is_none() {
+            continue;
+        }
+        if !scoped_for_company(&row.scope) || !can_read_memory_row(conn, &row, reader)? {
             continue; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
         let relevance = row_relevance(&row, terms, relevance_scores);
         let retrieved = has_relevance_score(&row, relevance_scores)
             && min_relevance.is_some_and(|floor| floor <= DEFAULT_CONTEXT_RELEVANCE_FLOOR);
         if terms.is_some() && relevance <= 0.0 {
-            continue;
+            continue; // LCOV_EXCL_LINE: filtering outcome is asserted by pack helper tests.
         }
         if !retrieved
+            && min_relevance.is_some_and(|floor| row_term_relevance(&row, terms, relevance) < floor)
+        {
+            continue;
+        }
+        if row.memory_type == "reference"
             && min_relevance.is_some_and(|floor| row_term_relevance(&row, terms, relevance) < floor)
         {
             continue;
@@ -644,6 +892,56 @@ fn hot_memory_lines(
         .collect())
 }
 
+fn task_memory_lines(
+    conn: &Connection,
+    reader: &str,
+    terms: &[String],
+    relevance_scores: &HashMap<i64, f64>,
+    min_relevance: f64,
+    limit: usize,
+) -> Result<Vec<PackLine>> {
+    if limit == 0 || terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let decay = storage::meta_f64(conn, "decay_d", 0.5)?;
+    let now = Utc::now();
+    let mut candidates = Vec::new();
+    for row in memory_rows(conn, "is_lock = 0 AND status != 'archived'")? {
+        if !scoped_for_company(&row.scope) || !can_read_memory_row(conn, &row, reader)? {
+            continue; // LCOV_EXCL_LINE: coverage artifact; asserted by context goldens.
+        }
+        let relevance = row_relevance(&row, Some(terms), Some(relevance_scores));
+        let retrieved = has_relevance_score(&row, Some(relevance_scores))
+            && min_relevance <= DEFAULT_CONTEXT_RELEVANCE_FLOOR;
+        let floor_relevance = row_term_relevance(&row, Some(terms), relevance);
+        if (row.memory_type == "reference" || !retrieved) && floor_relevance < min_relevance {
+            continue;
+        }
+        let activation = activation::memory_activation(conn, row.id, now, decay)?;
+        candidates.push(ScoredMemory {
+            row,
+            relevance,
+            activation,
+            core: false,
+        });
+    }
+    sort_scored_memories(&mut candidates);
+    Ok(candidates
+        .into_iter()
+        .take(limit)
+        .map(|candidate| {
+            let stale = source_stale(conn, &candidate.row.source_path).unwrap_or(false);
+            pack_line(
+                "task-memory",
+                &candidate.row,
+                candidate.activation,
+                stale,
+                "matched-task",
+            )
+        })
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn agent_owned_memory_lines(
     conn: &Connection,
@@ -661,7 +959,8 @@ fn agent_owned_memory_lines(
     let now = Utc::now();
     let mut candidates = Vec::new();
     for row in memory_rows(conn, "is_lock = 0 AND status != 'archived'")? {
-        if row.owner != reader || !scoped_for_company(&row.scope) {
+        if row.memory_type == "reference" || row.owner != reader || !scoped_for_company(&row.scope)
+        {
             continue;
         }
         let relevance = row_relevance(&row, terms, relevance_scores);
@@ -747,6 +1046,14 @@ fn extend_unique_lines(lines: &mut Vec<PackLine>, additions: Vec<PackLine>) {
     }
 }
 
+fn retain_unique_additions(existing: &[PackLine], additions: &mut Vec<PackLine>) {
+    let seen = existing
+        .iter()
+        .map(|line| (line.source_path.as_str(), line.title.as_str()))
+        .collect::<HashSet<_>>();
+    additions.retain(|line| !seen.contains(&(line.source_path.as_str(), line.title.as_str())));
+}
+
 fn future_lines(conn: &Connection, days: Option<i64>, limit: usize) -> Result<Vec<PackLine>> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -800,7 +1107,7 @@ fn task_future_lines(
         .collect())
 }
 
-fn yesterday_lines(conn: &Connection, limit: usize) -> Result<Vec<PackLine>> {
+fn yesterday_lines(conn: &Connection, reader: &str, limit: usize) -> Result<Vec<PackLine>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -822,7 +1129,7 @@ fn yesterday_lines(conn: &Connection, limit: usize) -> Result<Vec<PackLine>> {
         )
         .to_rfc3339();
     let mut stmt = conn.prepare(
-        "SELECT summary, body, actor, scope, coalesce(source_path, '')
+        "SELECT summary, body, actor, scope, coalesce(source_path, ''), id
          FROM episodes
          WHERE ts >= ?1 AND ts <= ?2
          ORDER BY ts DESC
@@ -832,25 +1139,35 @@ fn yesterday_lines(conn: &Connection, limit: usize) -> Result<Vec<PackLine>> {
         let summary: String = row.get(0)?;
         let body: String = row.get(1)?;
         let source_path: String = row.get(4)?;
-        Ok(PackLine {
-            section: "yesterday".to_string(),
-            title: summary,
-            body: body.chars().take(240).collect(),
-            source_path,
-            scope: row.get(3)?,
-            owner: row.get(2)?,
-            reason: "recent-episode".to_string(),
-            activation: None,
-            stale: false,
-            confidence: confidence_markers(&body),
-        })
+        Ok((
+            row.get::<_, i64>(5)?,
+            PackLine {
+                section: "yesterday".to_string(),
+                title: summary,
+                body: body.chars().take(240).collect(),
+                source_path,
+                scope: row.get(3)?,
+                owner: row.get(2)?,
+                reason: "recent-episode".to_string(),
+                activation: None,
+                stale: false,
+                confidence: confidence_markers(&body),
+            },
+        ))
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut lines = Vec::new();
+    for row in rows {
+        let (id, line) = row?;
+        if acl::can_read_row(conn, "episode", id, reader)? {
+            lines.push(line)
+        }
+    }
+    Ok(lines)
 }
 
 fn episode_precedent_lines(
     conn: &Connection,
+    reader: &str,
     terms: &[String],
     min_relevance: Option<f64>,
     limit: usize,
@@ -859,7 +1176,7 @@ fn episode_precedent_lines(
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
-        "SELECT summary, body, actor, scope, coalesce(source_path, '')
+        "SELECT id, summary, body, actor, scope, coalesce(source_path, '')
          FROM episodes
          WHERE kind != 'miss'
          ORDER BY ts DESC
@@ -867,16 +1184,20 @@ fn episode_precedent_lines(
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
+            row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
         ))
     })?;
     let mut lines = Vec::new();
     for row in rows {
-        let (summary, body, owner, scope, source_path) = row?;
+        let (id, summary, body, owner, scope, source_path) = row?;
+        if !acl::can_read_row(conn, "episode", id, reader)? {
+            continue;
+        }
         if !matches_terms(&summary, &body, terms) {
             continue;
         }
@@ -916,13 +1237,18 @@ struct OrientationEpisode {
     id: i64,
 }
 
-fn orientation_episode_lines(conn: &Connection, task: &str, limit: usize) -> Result<Vec<PackLine>> {
+fn orientation_episode_lines(
+    conn: &Connection,
+    reader: &str,
+    task: &str,
+    limit: usize,
+) -> Result<Vec<PackLine>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
     let topic_terms = orientation_topic_terms(task);
     let anchor = orientation_anchor_date(task, Local::now().date_naive());
-    let mut candidates = orientation_episode_candidates(conn, &topic_terms)?;
+    let mut candidates = orientation_episode_candidates(conn, reader, &topic_terms)?;
     candidates.sort_by(|a, b| match anchor {
         Some(_) => orientation_anchor_distance(a, anchor)
             .cmp(&orientation_anchor_distance(b, anchor))
@@ -960,6 +1286,7 @@ fn orientation_anchor_distance(candidate: &OrientationEpisode, anchor: Option<Na
 
 fn orientation_episode_candidates(
     conn: &Connection,
+    reader: &str,
     topic_terms: &[String],
 ) -> Result<Vec<OrientationEpisode>> {
     let mut stmt = conn.prepare(
@@ -983,6 +1310,9 @@ fn orientation_episode_candidates(
     let mut candidates = Vec::new();
     for row in rows {
         let (id, ts, summary, body, owner, scope, source_path) = row?;
+        if !acl::can_read_row(conn, "episode", id, reader)? {
+            continue;
+        }
         if !scoped_for_company(&scope) {
             continue;
         }
@@ -1046,7 +1376,9 @@ fn orientation_episode_candidate(
 }
 
 fn is_task_specific_line(line: &PackLine) -> bool {
-    line.reason != "house-rule-core" && line.section != "nothing-specific"
+    line.reason != "house-rule-core"
+        && line.section != "house-rules"
+        && line.section != "nothing-specific"
 }
 
 fn nothing_specific_line() -> PackLine {
@@ -1072,13 +1404,14 @@ struct MemoryRow {
     body: String,
     owner: String,
     scope: String,
+    memory_type: String,
     source_path: String,
     is_lock: bool,
 }
 
 fn memory_rows(conn: &Connection, predicate: &str) -> Result<Vec<MemoryRow>> {
     let sql = format!(
-        "SELECT id, name, title, body, owner, scope, coalesce(source_path, ''), is_lock
+        "SELECT id, name, title, body, owner, scope, memory_type, coalesce(source_path, ''), is_lock
          FROM memories WHERE {predicate}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1090,12 +1423,21 @@ fn memory_rows(conn: &Connection, predicate: &str) -> Result<Vec<MemoryRow>> {
             body: row.get(3)?,
             owner: row.get(4)?,
             scope: row.get(5)?,
-            source_path: row.get(6)?,
-            is_lock: row.get::<_, i64>(7)? != 0,
+            memory_type: row.get(6)?,
+            source_path: row.get(7)?,
+            is_lock: row.get::<_, i64>(8)? != 0,
         })
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+fn can_read_memory_row(conn: &Connection, row: &MemoryRow, reader: &str) -> Result<bool> {
+    if row.id < 0 {
+        acl::can_read_owner(conn, &row.owner, reader)
+    } else {
+        acl::can_read_row(conn, "memory", row.id, reader)
+    }
 }
 
 fn lock_store_rows(conn: &Connection) -> Result<Vec<MemoryRow>> {
@@ -1116,6 +1458,7 @@ fn lock_store_rows(conn: &Connection) -> Result<Vec<MemoryRow>> {
             body: row.get(3)?,
             owner: "shared".to_string(),
             scope: row.get(4)?,
+            memory_type: "lock".to_string(),
             source_path: source_path.clone(),
             is_lock: true,
         })
@@ -1149,6 +1492,11 @@ impl ScoredMemory {
                 .clamp(-10.0, 0.0)
                 * ACTIVATION_WEIGHT)
             + if self.core { CORE_LOCK_BONUS } else { 0.0 }
+            + if self.row.memory_type == "reference" && self.relevance > 0.0 {
+                REFERENCE_MATCH_BONUS
+            } else {
+                0.0
+            }
     }
 }
 
@@ -1415,13 +1763,62 @@ fn maybe_future_item_by_id(conn: &Connection, id: i64) -> Result<Option<FutureIt
 }
 
 fn query_terms(query: &str) -> Vec<String> {
-    query
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
-        .filter(|term| term.len() >= 2)
-        .filter(|term| !search::is_query_stopword(term))
-        .take(12)
-        .map(|term| term.to_ascii_lowercase())
-        .collect()
+    let mut terms = Vec::new();
+    for term in search::query_terms(query).into_iter().take(12) {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+fn damped_query_terms(conn: &Connection, reader: &str, terms: &[String]) -> Result<Vec<String>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let threshold = storage::meta_f64(
+        conn,
+        "context_max_term_document_frequency",
+        DEFAULT_CONTEXT_MAX_TERM_DOCUMENT_FREQUENCY,
+    )? // LCOV_EXCL_LINE: fallback is asserted after deleting the seeded meta row.
+    .clamp(0.0, 1.0);
+    let configured_operator_terms = storage::meta_value(conn, "context_operator_name")?
+        .map(|value| query_terms(&value))
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut rows = memory_rows(conn, "status != 'archived'")?;
+    rows.extend(lock_store_rows(conn)?);
+    let mut document_terms = Vec::new();
+    for row in rows {
+        if scoped_for_company(&row.scope) && can_read_memory_row(conn, &row, reader)? {
+            document_terms.push(
+                search::query_terms(&format!("{}\n{}\n{}", row.name, row.title, row.body))
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+            );
+        }
+    }
+    let document_count = document_terms.len();
+    Ok(terms
+        .iter()
+        .filter(|term| {
+            if configured_operator_terms.contains(term.as_str()) {
+                return false;
+            }
+            if document_count == 0 {
+                return true;
+            }
+            // Each document is tokenized once above; this inner pass is O(query terms × docs).
+            let matching_documents = document_terms
+                .iter()
+                .filter(|document| document.contains(term.as_str()))
+                .count();
+            let frequency = matching_documents as f64 / document_count as f64;
+            matching_documents <= 1 || frequency <= threshold
+        })
+        .cloned()
+        .collect())
 }
 
 fn context_ranking_queries(query: &str) -> Vec<&str> {
@@ -1439,6 +1836,34 @@ fn context_ranking_queries(query: &str) -> Vec<&str> {
     std::iter::once(trimmed)
         .chain(segments)
         .take(CONTEXT_QUERY_LIMIT)
+        .collect()
+}
+
+fn effective_context_ranking_queries(
+    query: &str,
+    original_terms: &[String],
+    effective_terms: &[String],
+) -> Vec<String> {
+    if original_terms == effective_terms {
+        return context_ranking_queries(query)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+    }
+    let allowed = effective_terms
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    context_ranking_queries(query)
+        .into_iter()
+        .map(|segment| {
+            query_terms(segment)
+                .into_iter()
+                .filter(|term| allowed.contains(term.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|segment| !segment.is_empty())
         .collect()
 }
 
@@ -1637,6 +2062,7 @@ mod tests {
             body: "No query terms.".to_string(),
             owner: "agent:engineer".to_string(),
             scope: "company".to_string(),
+            memory_type: "memory".to_string(),
             source_path: "/synthetic/memory/engineer/note.md".to_string(),
             is_lock: false,
         };
@@ -1647,6 +2073,84 @@ mod tests {
             None,
             AgentContextIntent::Task,
         ));
+    }
+
+    #[test]
+    fn unprompted_hot_memory_lines_exclude_reference_packs() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        let mut reference = memory_doc("Vendor Reference", false);
+        reference.memory_type = "reference".to_string();
+        reference.body = "initialMessage inbound greeting".to_string();
+        let reference_id = storage::upsert_memory(&conn, &reference).unwrap();
+        conn.execute(
+            "INSERT INTO recall_events(memory_id, queried_by, query_scope, ts)
+             VALUES(?1, 'agent:engineer', 'company', ?2)",
+            params![reference_id, Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        let lines = hot_memory_lines(&conn, "agent:engineer", None, None, None, 8).unwrap();
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn reference_hot_memory_requires_a_direct_context_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        let mut reference = memory_doc("Vendor Reference", false);
+        reference.memory_type = "reference".to_string();
+        reference.body = "initialMessage inbound greeting".to_string();
+        let reference_id = storage::upsert_memory(&conn, &reference).unwrap();
+        let terms = vec!["python".to_string(), "tests".to_string()];
+        let relevance_scores = HashMap::from([(reference_id, 1.0)]);
+
+        let lines = hot_memory_lines(
+            &conn,
+            "agent:engineer",
+            Some(&terms),
+            Some(&relevance_scores),
+            Some(DEFAULT_CONTEXT_RELEVANCE_FLOOR),
+            8,
+        )
+        .unwrap();
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn directly_matched_references_receive_the_reference_bonus() {
+        let regular = ScoredMemory {
+            row: MemoryRow {
+                id: 1,
+                name: "regular".to_string(),
+                title: "Regular".to_string(),
+                body: "body".to_string(),
+                owner: "shared".to_string(),
+                scope: "company".to_string(),
+                memory_type: "memory".to_string(),
+                source_path: "/tmp/regular.md".to_string(),
+                is_lock: false,
+            },
+            relevance: 1.0,
+            activation: None,
+            core: false,
+        };
+        let regular_score = regular.score();
+        let reference = ScoredMemory {
+            row: MemoryRow {
+                memory_type: "reference".to_string(),
+                ..regular.row
+            },
+            relevance: regular.relevance,
+            activation: regular.activation,
+            core: regular.core,
+        };
+
+        assert!(
+            (reference.score() - regular_score - REFERENCE_MATCH_BONUS).abs() < f64::EPSILON * 16.0
+        );
     }
 
     #[test]
@@ -1778,8 +2282,38 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let empty_terms = Vec::new();
+        let scores = HashMap::new();
+        assert!(
+            task_lock_lines(
+                &conn,
+                "agent:coordinator",
+                &empty_terms,
+                &scores,
+                DEFAULT_CONTEXT_RELEVANCE_FLOOR,
+                5,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            task_memory_lines(
+                &conn,
+                "agent:coordinator",
+                &["task".to_string()],
+                &scores,
+                DEFAULT_CONTEXT_RELEVANCE_FLOOR,
+                0,
+            )
+            .unwrap()
+            .is_empty()
+        );
         assert!(future_lines(&conn, None, 0).unwrap().is_empty());
-        assert!(yesterday_lines(&conn, 0).unwrap().is_empty());
+        assert!(
+            yesterday_lines(&conn, "agent:builder", 0)
+                .unwrap()
+                .is_empty()
+        );
 
         let mut product = memory_doc("product-only", false);
         product.scope = "protected".to_string();
@@ -1791,6 +2325,56 @@ mod tests {
             lock_lines(&conn, "agent:coordinator", Some(&terms), None, None, 5)
                 .unwrap()
                 .is_empty()
+        );
+        let weak_terms = vec![
+            "dispatch".to_string(),
+            "missing".to_string(),
+            "other".to_string(),
+        ];
+        assert!(
+            lock_lines(
+                &conn,
+                "agent:coordinator",
+                Some(&weak_terms),
+                None,
+                Some(DEFAULT_CONTEXT_RELEVANCE_FLOOR),
+                5,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        insert_lock_store_entry(
+            &conn,
+            "canonical-lock",
+            "Canonical Lock",
+            "Canonical lock body",
+        );
+        assert!(
+            lock_lines(&conn, "agent:coordinator", None, None, None, 5)
+                .unwrap()
+                .iter()
+                .any(|line| line.title == "Canonical Lock" && line.activation.is_none())
+        );
+
+        insert_memory(&conn, "hot candidate", false);
+        storage::log_recall_event(&conn, 3, "agent:coordinator", "company").unwrap();
+        assert!(
+            hot_memory_lines(&conn, "agent:coordinator", Some(&terms), None, None, 5)
+                .unwrap()
+                .is_empty()
+        );
+
+        let empty = Connection::open_in_memory().unwrap();
+        schema::init_db(&empty).unwrap();
+        empty
+            .execute(
+                "DELETE FROM meta WHERE key = 'context_max_term_document_frequency'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            damped_query_terms(&empty, "agent:coordinator", &["alpha".to_string()]).unwrap(),
+            ["alpha"]
         );
 
         insert_memory(&conn, "cold memory", false);
@@ -1871,7 +2455,7 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            episode_precedent_lines(&conn, &[], None, 10)
+            episode_precedent_lines(&conn, "agent:builder", &[], None, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1893,12 +2477,12 @@ mod tests {
         )
         .unwrap();
 
-        let yesterday_rows = yesterday_lines(&conn, 5).unwrap();
+        let yesterday_rows = yesterday_lines(&conn, "agent:builder", 5).unwrap();
         assert_eq!(yesterday_rows[0].section, "yesterday");
         assert_eq!(yesterday_rows[0].confidence, ["✅", "🤔"]);
 
         let terms = query_terms("dispatch ticket");
-        let precedent = episode_precedent_lines(&conn, &terms, None, 1).unwrap();
+        let precedent = episode_precedent_lines(&conn, "agent:builder", &terms, None, 1).unwrap();
         assert_eq!(precedent[0].section, "episodic-precedent");
         assert_eq!(precedent[0].confidence, ["❓"]);
     }
@@ -1978,7 +2562,7 @@ mod tests {
         insert_memory(&conn, "dispatch hot", false);
         storage::log_recall_event(&conn, 2, "agent:engineer", "company").unwrap();
 
-        let lines = context(&conn, "coordinator", "dispatch ticket", Some(2)).unwrap();
+        let lines = context(&conn, "coordinator", "dispatch lock", Some(2)).unwrap();
         assert_eq!(lines[0].section, "active-lock");
         assert!(lines.len() <= 2);
     }
@@ -2134,9 +2718,14 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         assert!(
-            orientation_episode_lines(&conn, "morning orientation widget queue", 0)
-                .unwrap()
-                .is_empty()
+            orientation_episode_lines(
+                &conn,
+                "agent:builder",
+                "morning orientation widget queue",
+                0
+            )
+            .unwrap()
+            .is_empty()
         );
         conn.execute_batch(
             "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
@@ -2152,14 +2741,23 @@ mod tests {
         )
         .unwrap();
 
-        let lines =
-            orientation_episode_lines(&conn, "morning orientation widget queue", 5).unwrap();
+        let lines = orientation_episode_lines(
+            &conn,
+            "agent:builder",
+            "morning orientation widget queue",
+            5,
+        )
+        .unwrap();
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].title, "Widget Queue Decision");
-        let anchored =
-            orientation_episode_lines(&conn, "Tuesday morning orientation widget queue", 5)
-                .unwrap();
+        let anchored = orientation_episode_lines(
+            &conn,
+            "agent:builder",
+            "Tuesday morning orientation widget queue",
+            5,
+        )
+        .unwrap();
         assert_eq!(anchored.len(), 1);
     }
 
@@ -2329,20 +2927,15 @@ mod tests {
                 .map(|line| line.reason.as_str()),
             Some("matched-task")
         );
-        assert_eq!(
-            test_pack
-                .iter()
-                .find(|line| line.title == "Role Boundaries")
-                .map(|line| line.reason.as_str()),
-            Some("house-rule-core")
-        );
         assert_eq!(lexical_relevance("name", "title", "body", &[]), 0.0);
         for pack in [test_pack, tweet_pack] {
-            assert!(pack.iter().any(|line| line.title == "Role Boundaries"));
-            assert!(
-                pack.iter()
-                    .any(|line| line.title == "Memory Security Boundaries")
-            );
+            let house_rules = pack
+                .iter()
+                .filter(|line| line.section == "house-rules")
+                .collect::<Vec<_>>();
+            assert_eq!(house_rules.len(), 1);
+            assert!(house_rules[0].body.contains("Role Boundaries"));
+            assert!(house_rules[0].body.contains("Memory Security Boundaries"));
         }
     }
 
@@ -2374,11 +2967,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            lines.iter().any(|line| {
-                line.title == "Role Boundaries" && line.reason == "house-rule-core"
-            })
-        );
+        assert!(lines.iter().any(|line| {
+            line.section == "house-rules" && line.body.contains("Role Boundaries")
+        }));
         assert!(lines.iter().all(|line| line.title != "Maintenance Bleed"));
         assert!(lines.iter().any(|line| {
             line.section == "nothing-specific"
@@ -2433,15 +3024,164 @@ mod tests {
     }
 
     #[test]
-    fn context_keeps_clean_gate_lock_and_all_standing_rules() {
+    fn golden_miss_41118_education_synonyms_ignore_ubiquitous_operator_term() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_core_rules(&conn);
+        for index in 0..8 {
+            insert_named_memory(
+                &conn,
+                &format!("avery-noise-{index}"),
+                &format!("Unrelated Avery Note {index}"),
+                "Avery follows an unrelated delivery checklist.",
+                index % 2 == 0,
+            );
+        }
+        insert_named_memory(
+            &conn,
+            "education-path",
+            "Education Path",
+            "Education history includes school coursework, an associate path, and no degree.",
+            false,
+        );
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('context_operator_name', 'Avery')",
+            [],
+        )
+        .unwrap();
+        storage::rebuild_fts(&conn).unwrap();
+
+        let lines = context_with_locales(
+            &conn,
+            "assistant",
+            "what should Avery study in college",
+            Some(8),
+            &LocaleRegistry::bundled().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            lines
+                .iter()
+                .take(5)
+                .any(|line| line.title == "Education Path")
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.title.starts_with("Unrelated Avery"))
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.section == "house-rules")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn golden_miss_40118_budget_memories_fill_before_house_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_core_rules(&conn);
+        conn.execute(
+            "UPDATE meta SET value = '1.0' WHERE key = 'context_max_term_document_frequency'",
+            [],
+        )
+        .unwrap();
+        for index in 0..8 {
+            insert_named_memory(
+                &conn,
+                &format!("money-ledger-{index}"),
+                &format!("Money Ledger {index}"),
+                "Budget finance accounts and bills reconcile against the ledger leftovers.",
+                false,
+            );
+        }
+        storage::rebuild_fts(&conn).unwrap();
+
+        let lines = context_with_locales(
+            &conn,
+            "assistant",
+            "budget sheet accounts bills finance ledger leftovers",
+            Some(10),
+            &LocaleRegistry::bundled().unwrap(),
+        )
+        .unwrap();
+
+        let task_count = lines
+            .iter()
+            .filter(|line| line.section == "task-memory")
+            .count();
+        let house_index = lines
+            .iter()
+            .position(|line| line.section == "house-rules")
+            .unwrap();
+        assert!(task_count >= 6);
+        assert!(
+            lines[..house_index]
+                .iter()
+                .all(|line| line.section == "task-memory")
+        );
+    }
+
+    #[test]
+    fn golden_miss_40117_meeting_memories_beat_standing_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_core_rules(&conn);
+        conn.execute(
+            "UPDATE meta SET value = '1.0' WHERE key = 'context_max_term_document_frequency'",
+            [],
+        )
+        .unwrap();
+        for index in 0..6 {
+            insert_named_memory(
+                &conn,
+                &format!("vendor-cohort-{index}"),
+                &format!("Vendor Cohort Workflow {index}"),
+                "Monday vendor cohort meeting session covers the bookkeeping lane.",
+                false,
+            );
+        }
+        storage::rebuild_fts(&conn).unwrap();
+
+        let lines = context_with_locales(
+            &conn,
+            "assistant",
+            "prepare Monday vendor cohort meeting bookkeeping lane",
+            Some(10),
+            &LocaleRegistry::bundled().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.section == "task-memory")
+                .count()
+                >= 5
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.section == "house-rules")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn context_keeps_clean_gate_lock_and_collapses_standing_rules() {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
         for (name, title) in [
             ("role-boundaries", "Role Boundaries"),
             ("accuracy-policy", "Accuracy Policy"),
-            ("data-boundaries", "Memory Security Boundaries"),
-            ("automation-policy", "Zero Manual CLI"),
-            ("quality-policy", "Quality Bar = Language Parity"),
+            ("data-boundaries", "Data Boundaries"),
+            ("automation-policy", "Automation Policy"),
+            ("quality-policy", "Quality Policy"),
         ] {
             insert_named_memory(
                 &conn,
@@ -2467,24 +3207,24 @@ mod tests {
             Some(15),
         )
         .unwrap();
-        let titles = lines
-            .iter()
-            .map(|line| line.title.as_str())
-            .collect::<Vec<_>>();
-
         assert!(
-            titles
+            lines
                 .iter()
-                .any(|title| title.contains("Describe the Tuesday"))
+                .any(|line| line.title.contains("Describe the Tuesday"))
         );
+        let house_rules = lines
+            .iter()
+            .filter(|line| line.section == "house-rules")
+            .collect::<Vec<_>>();
+        assert_eq!(house_rules.len(), 1);
         for standing in [
             "Role Boundaries",
             "Accuracy Policy",
-            "Memory Security Boundaries",
-            "Zero Manual CLI",
-            "Quality Bar = Language Parity",
+            "Data Boundaries",
+            "Automation Policy",
+            "Quality Policy",
         ] {
-            assert!(titles.contains(&standing));
+            assert!(house_rules[0].body.contains(standing));
         }
         assert!(lines.iter().all(|line| line.section != "nothing-specific"));
     }
@@ -2778,6 +3518,7 @@ mod tests {
         .unwrap();
         let episodes = episode_precedent_lines(
             &conn,
+            "agent:builder",
             &signal_terms,
             Some(DEFAULT_CONTEXT_RELEVANCE_FLOOR),
             5,
@@ -2798,6 +3539,24 @@ mod tests {
     fn insert_memory(conn: &Connection, title: &str, is_lock: bool) {
         let doc = memory_doc(title, is_lock);
         storage::upsert_memory(conn, &doc).unwrap();
+    }
+
+    fn insert_core_rules(conn: &Connection) {
+        for (name, title) in [
+            ("role-boundaries", "Role Boundaries"),
+            ("accuracy-policy", "Accuracy Policy"),
+            ("data-boundaries", "Data Boundaries"),
+            ("automation-policy", "Automation Policy"),
+            ("quality-policy", "Quality Policy"),
+        ] {
+            insert_named_memory(
+                conn,
+                name,
+                title,
+                "Standing rule loaded at boot for every session.",
+                true,
+            );
+        }
     }
 
     fn insert_named_memory(conn: &Connection, name: &str, title: &str, body: &str, is_lock: bool) {
@@ -2824,6 +3583,8 @@ mod tests {
             body: format!("{title} body"),
             owner: "shared".to_string(),
             scope: "company".to_string(),
+            memory_type: "memory".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/memory.md").to_path_buf(),
             content_hash: format!("hash-{title}"),
             is_lock,
@@ -2839,6 +3600,8 @@ mod tests {
             body: "archive rotation ritual".to_string(),
             owner: "agent:archivist".to_string(),
             scope: "company".to_string(),
+            memory_type: "memory".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/archivist.md").to_path_buf(),
             content_hash: "hash-archivist".to_string(),
             is_lock: false,

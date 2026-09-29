@@ -11,6 +11,8 @@ pub struct MemoryDoc {
     pub body: String,
     pub owner: String,
     pub scope: String,
+    pub memory_type: String,
+    pub visibility: Option<String>,
     pub source_path: PathBuf,
     pub content_hash: String,
     pub is_lock: bool,
@@ -26,6 +28,7 @@ pub struct EpisodeDoc {
     pub summary: String,
     pub body: String,
     pub scope: String,
+    pub visibility: Option<String>,
     pub source_path: PathBuf,
 }
 
@@ -35,10 +38,21 @@ struct ExternalFrontmatter {
     title: Option<String>,
     description: Option<String>,
     owner: Option<String>,
+    #[serde(rename = "type")]
+    memory_type: Option<String>,
+    #[serde(default)]
+    metadata: ExternalMetadata,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ExternalMetadata {
+    #[serde(rename = "type")]
+    memory_type: Option<String>,
 }
 
 pub fn parse_external_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
     let (frontmatter, body) = split_frontmatter(text);
+    let visibility = frontmatter_visibility(frontmatter);
     let parsed: ExternalFrontmatter = frontmatter
         .and_then(|raw| serde_yaml::from_str(raw).ok())
         .unwrap_or_default();
@@ -46,6 +60,12 @@ pub fn parse_external_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("memory");
+    let memory_type = parsed
+        .memory_type
+        .or(parsed.metadata.memory_type)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "memory".to_string());
     let title = parsed
         .title
         .or(parsed.description)
@@ -53,15 +73,31 @@ pub fn parse_external_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
     let name = parsed.name.unwrap_or_else(|| slugify(fallback));
     let body = body.trim().to_string();
     let scope = classify_scope_for_memory(path, &name, &title, &body);
-    vec![MemoryDoc::new(
-        name,
-        title,
-        body,
-        owner_for_path(path),
-        scope,
-        path,
-        false,
-    )]
+    let owner = if memory_type == "reference" && visibility.as_deref() != Some("private") {
+        "shared".to_string()
+    } else {
+        owner_for_path(path)
+    };
+    let mut doc = MemoryDoc::new(name, title, body, owner, scope, memory_type, path, false);
+    doc.visibility = visibility;
+    vec![doc]
+}
+
+fn normalize_visibility(value: &str) -> String {
+    if value.trim().eq_ignore_ascii_case("shared") {
+        "shared".to_string()
+    } else {
+        // An invalid explicit value must never turn a sensitive row public.
+        "private".to_string()
+    }
+}
+
+fn frontmatter_visibility(frontmatter: Option<&str>) -> Option<String> {
+    // Preserve an explicit private marker even when another YAML field is malformed.
+    let raw = frontmatter?
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("visibility:"))?;
+    Some(normalize_visibility(raw.trim().trim_matches(['"', '\''])))
 }
 
 pub fn parse_agent_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
@@ -73,7 +109,9 @@ pub fn parse_agent_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
         .filter(|owner| !owner.trim().is_empty())
         .map(|owner| normalize_agent_owner(&owner));
     for doc in &mut docs {
-        if let Some(owner) = explicit_owner.as_ref() {
+        if (doc.memory_type != "reference" || doc.visibility.as_deref() == Some("private"))
+            && let Some(owner) = explicit_owner.as_ref()
+        {
             doc.owner.clone_from(owner);
         }
         if !has_explicit_product_scope(&doc.body) {
@@ -94,6 +132,7 @@ fn normalize_agent_owner(owner: &str) -> String {
 }
 
 pub fn parse_system_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
+    let visibility = frontmatter_visibility(split_frontmatter(text).0);
     let mut docs = Vec::new();
     let mut current_title: Option<String> = None;
     let mut current_body = Vec::new();
@@ -107,6 +146,9 @@ pub fn parse_system_memory(path: &Path, text: &str) -> Vec<MemoryDoc> {
         }
     }
     flush_system_memory(path, &mut docs, &mut current_title, &mut current_body);
+    for doc in &mut docs {
+        doc.visibility.clone_from(&visibility);
+    }
     docs
 }
 
@@ -130,6 +172,7 @@ pub fn parse_team_log(path: &Path, text: &str) -> Vec<EpisodeDoc> {
 }
 
 pub fn parse_markdown_episode_file(path: &Path, text: &str, kind: &str) -> Vec<EpisodeDoc> {
+    let visibility = frontmatter_visibility(split_frontmatter(text).0);
     let ts = ts_from_text_or_path(text, path);
     let actor = actor_from_text_or_path(text, path);
     let scope = classify_scope_for_markdown(path, text);
@@ -140,7 +183,7 @@ pub fn parse_markdown_episode_file(path: &Path, text: &str, kind: &str) -> Vec<E
         .collect();
 
     if lines.is_empty() {
-        return vec![EpisodeDoc::new(
+        let mut doc = EpisodeDoc::new(
             ts,
             actor,
             kind,
@@ -150,7 +193,9 @@ pub fn parse_markdown_episode_file(path: &Path, text: &str, kind: &str) -> Vec<E
             "",
             scope,
             path,
-        )];
+        );
+        doc.visibility = visibility;
+        return vec![doc];
     }
 
     lines
@@ -159,7 +204,7 @@ pub fn parse_markdown_episode_file(path: &Path, text: &str, kind: &str) -> Vec<E
         .enumerate()
         .map(|(idx, line)| {
             let line_ts = offset_seconds(&ts, idx as i64);
-            EpisodeDoc::new(
+            let mut doc = EpisodeDoc::new(
                 line_ts,
                 actor.clone(),
                 kind,
@@ -167,12 +212,15 @@ pub fn parse_markdown_episode_file(path: &Path, text: &str, kind: &str) -> Vec<E
                 *line,
                 scope.clone(),
                 path,
-            )
+            );
+            doc.visibility.clone_from(&visibility);
+            doc
         })
         .collect()
 }
 
 pub fn parse_meeting_file(path: &Path, text: &str) -> Vec<EpisodeDoc> {
+    let visibility = frontmatter_visibility(split_frontmatter(text).0);
     let ts = ts_from_text_or_path(text, path);
     let actor = actor_from_text_or_path(text, path);
     let scope = classify_scope_for_markdown(path, text);
@@ -207,7 +255,7 @@ pub fn parse_meeting_file(path: &Path, text: &str) -> Vec<EpisodeDoc> {
     flush_meeting_section(&mut sections, &mut current_heading, &mut current_body);
 
     if sections.is_empty() {
-        return vec![EpisodeDoc::new(
+        let mut doc = EpisodeDoc::new(
             ts,
             actor,
             "meeting",
@@ -217,7 +265,9 @@ pub fn parse_meeting_file(path: &Path, text: &str) -> Vec<EpisodeDoc> {
             "",
             scope,
             path,
-        )];
+        );
+        doc.visibility = visibility;
+        return vec![doc];
     }
 
     sections
@@ -231,7 +281,7 @@ pub fn parse_meeting_file(path: &Path, text: &str) -> Vec<EpisodeDoc> {
             let searchable_body = heading
                 .map(|heading| format!("{heading}\n{body}"))
                 .unwrap_or(body);
-            EpisodeDoc::new(
+            let mut doc = EpisodeDoc::new(
                 offset_seconds(&ts, idx as i64),
                 actor.clone(),
                 "meeting",
@@ -239,7 +289,9 @@ pub fn parse_meeting_file(path: &Path, text: &str) -> Vec<EpisodeDoc> {
                 searchable_body,
                 scope.clone(),
                 path,
-            )
+            );
+            doc.visibility.clone_from(&visibility);
+            doc
         })
         .collect()
 }
@@ -448,7 +500,7 @@ fn flush_system_memory(
     let name = slugify(&title);
     let scope = classify_scope_for_memory(path, &name, &title, &body);
     docs.push(MemoryDoc::new(
-        name, title, body, "shared", scope, path, is_lock,
+        name, title, body, "shared", scope, "memory", path, is_lock,
     ));
 }
 
@@ -547,23 +599,34 @@ fn sha256_hex(text: &str) -> String {
 }
 
 impl MemoryDoc {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
         title: String,
         body: String,
         owner: impl Into<String>,
         scope: impl Into<String>,
+        memory_type: impl Into<String>,
         source_path: &Path,
         is_lock: bool,
     ) -> Self {
         let now = Utc::now().to_rfc3339();
-        let hash_input = format!("{}\n{}\n{}", title, body, source_path.display());
+        let memory_type = memory_type.into();
+        let hash_input = format!(
+            "{}\n{}\n{}\n{}",
+            title,
+            body,
+            memory_type,
+            source_path.display()
+        );
         Self {
             name,
             title,
             body,
             owner: owner.into(),
             scope: scope.into(),
+            visibility: None,
+            memory_type,
             source_path: source_path.to_path_buf(),
             content_hash: sha256_hex(&hash_input),
             is_lock,
@@ -590,6 +653,7 @@ impl EpisodeDoc {
             summary: summary.as_ref().chars().take(240).collect(),
             body: body.as_ref().to_string(),
             scope: scope.into(),
+            visibility: None,
             source_path: source_path.to_path_buf(),
         }
     }
@@ -765,6 +829,63 @@ mod tests {
     }
 
     #[test]
+    fn visibility_frontmatter_marks_memories_and_episode_files() {
+        let memory = parse_agent_memory(
+            Path::new("/tmp/a.md"),
+            "---\nowner: a\nvisibility: private\n---\nA secret",
+        );
+        assert_eq!(memory[0].visibility.as_deref(), Some("private"));
+        assert_eq!(memory[0].owner, "agent:a");
+        let private_reference = parse_agent_memory(
+            Path::new("/tmp/private-reference.md"),
+            "---\nowner: a\ntype: reference\nvisibility: private\n---\nA source",
+        );
+        assert_eq!(private_reference[0].owner, "agent:a");
+        let shared = parse_external_memory(
+            Path::new("/tmp/b.md"),
+            "---\nvisibility: shared\n---\nA note",
+        );
+        assert_eq!(shared[0].visibility.as_deref(), Some("shared"));
+        let invalid = parse_external_memory(
+            Path::new("/tmp/c.md"),
+            "---\nvisibility: unknown\n---\nA note",
+        );
+        assert_eq!(invalid[0].visibility.as_deref(), Some("private"));
+        let malformed = parse_external_memory(
+            Path::new("/tmp/malformed.md"),
+            "---\nvisibility: private\nother: [\n---\nA note",
+        );
+        assert_eq!(malformed[0].visibility.as_deref(), Some("private"));
+        let unmarked = parse_external_memory(Path::new("/tmp/d.md"), "A note");
+        assert_eq!(unmarked[0].visibility, None);
+
+        let episode = parse_markdown_episode_file(
+            Path::new("/tmp/e.md"),
+            "---\nvisibility: private\n---\n# A note",
+            "ticket",
+        );
+        assert!(
+            episode
+                .iter()
+                .all(|row| row.visibility.as_deref() == Some("private"))
+        );
+        let meeting = parse_meeting_file(
+            Path::new("/tmp/m.md"),
+            "---\nvisibility: private\n---\n# Meeting\n## Decision\nA note",
+        );
+        assert!(
+            meeting
+                .iter()
+                .all(|row| row.visibility.as_deref() == Some("private"))
+        );
+        let system = parse_system_memory(
+            Path::new("/tmp/system.md"),
+            "---\nvisibility: private\n---\n## Note\nSensitive text",
+        );
+        assert_eq!(system[0].visibility.as_deref(), Some("private"));
+    }
+
+    #[test]
     fn malformed_frontmatter_falls_back_to_filename_title() {
         let docs = parse_external_memory(
             Path::new("/tmp/custom_memory.md"),
@@ -795,6 +916,18 @@ mod tests {
         );
 
         assert_eq!(docs[0].owner, "agent:cafe_owner");
+        assert_eq!(docs[0].scope, "company");
+    }
+
+    #[test]
+    fn reference_metadata_stays_shared_inside_memory_directories() {
+        let docs = parse_agent_memory(
+            Path::new("/tmp/workspace/memory/vendor-docs/phone.md"),
+            "---\nname: vendor-phone\nmetadata:\n  type: reference\n---\nPhone docs.",
+        );
+
+        assert_eq!(docs[0].memory_type, "reference");
+        assert_eq!(docs[0].owner, "shared");
         assert_eq!(docs[0].scope, "company");
     }
 

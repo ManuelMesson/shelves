@@ -114,6 +114,14 @@ def test_golden_search_queries_hit_fictional_fixture_corpus(workspace: dict[str,
 
 
 def test_context_pack_uses_locks_and_relevance_floor(workspace: dict[str, str]) -> None:
+    corpus = Path(workspace["AIOS_ROOT"]) / "synthetic-corpus"
+    shutil.copytree(GOLDEN_FIXTURES, corpus)
+    for index in range(10):
+        (corpus / f"unrelated-{index}.md").write_text(
+            f"---\nname: unrelated_{index}\ntitle: Unrelated Note {index}\n---\n"
+            "An independent synthetic note about garden tools.\n"
+        )
+    workspace["SHELVES_EXTRA_SOURCE_DIR"] = str(corpus)
     ingest_fixture_corpus(workspace)
 
     focused = run_shelves(
@@ -127,7 +135,8 @@ def test_context_pack_uses_locks_and_relevance_floor(workspace: dict[str, str]) 
     rows = json.loads(focused.stdout)
     titles = [row["title"] for row in rows]
     assert "Checkout Retry Rule" in titles
-    assert rows[0]["section"] == "active-lock"
+    assert rows[0]["section"] == "task-memory"
+    assert any(row["section"] == "active-lock" for row in rows)
 
     unrelated = run_shelves(
         "context",

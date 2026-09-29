@@ -6,7 +6,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::{activation, locks, storage, workspace_root};
+use crate::{acl, activation, locks, storage, workspace_root};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsolidationReport {
@@ -62,8 +62,25 @@ struct MemoryForGraduation {
 }
 
 pub fn consolidate(conn: &Connection, at_close: bool) -> Result<ConsolidationReport> {
-    let mut report = build_consolidation_report(conn, at_close)?;
-    let path = write_report(&report)?;
+    consolidate_as(conn, at_close, "agent:builder")
+}
+
+pub fn consolidate_as(
+    conn: &Connection,
+    at_close: bool,
+    reader: &str,
+) -> Result<ConsolidationReport> {
+    let mut report = build_consolidation_report_as(conn, at_close, reader)?;
+    // Reports are shared files outside the engine's row ACL. Keep private
+    // candidates in the authorized caller's result, never in that projection.
+    let mut persisted = report.clone();
+    persisted.candidates.clear();
+    for candidate in &report.candidates {
+        if !acl::row_is_private(conn, "memory", candidate.id)? {
+            persisted.candidates.push(candidate.clone());
+        }
+    }
+    let path = write_report(&persisted)?;
     report.report_path = Some(path.to_string_lossy().to_string());
     Ok(report)
 }
@@ -72,6 +89,14 @@ pub fn build_consolidation_report(
     conn: &Connection,
     at_close: bool,
 ) -> Result<ConsolidationReport> {
+    build_consolidation_report_as(conn, at_close, "agent:builder")
+}
+
+pub fn build_consolidation_report_as(
+    conn: &Connection,
+    at_close: bool,
+    reader: &str,
+) -> Result<ConsolidationReport> {
     let generated_at = Utc::now().to_rfc3339();
     let threshold = storage::meta_usize(conn, "promotion_recall_threshold", 2)?;
     let decay = storage::meta_f64(conn, "decay_d", 0.5)?;
@@ -79,7 +104,7 @@ pub fn build_consolidation_report(
     let now = Utc::now();
     let mut candidates = Vec::new();
 
-    for memory in graduation_memories(conn)? {
+    for memory in graduation_memories(conn, reader)? {
         let recall_counts = recall_counts_by_scope(conn, memory.id)?;
         let higher_count = higher_scope_count(&memory.scope, &recall_counts);
         let activation = activation::memory_activation(conn, memory.id, now, decay)?;
@@ -154,6 +179,10 @@ pub fn promote(conn: &Connection, id: i64, to_scope: &str, by: &str) -> Result<P
     if !locks::validate_scope(to_scope) {
         bail!("scope must be os, company, or product:<slug>");
     }
+    let reader = format!("agent:{}", by.trim_start_matches("agent:"));
+    if !acl::can_read_row(conn, "memory", id, &reader)? {
+        bail!("memory {id} not found or not readable by {by}");
+    }
     let memory = memory_by_id(conn, id)?.ok_or_else(|| anyhow::anyhow!("memory {id} not found"))?;
     if memory.scope == to_scope {
         return Ok(PromoteOutcome {
@@ -187,33 +216,40 @@ pub fn promote(conn: &Connection, id: i64, to_scope: &str, by: &str) -> Result<P
         "UPDATE memories SET scope = ?1, updated_at = ?2 WHERE id = ?3",
         params![to_scope, Utc::now().to_rfc3339(), id],
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    let summary = format!("{} -> {}: {}", memory.scope, to_scope, memory.name);
+    let private = acl::row_is_private(conn, "memory", id)?;
+    let summary = if private {
+        "private memory promoted".to_string()
+    } else {
+        format!("{} -> {}: {}", memory.scope, to_scope, memory.name)
+    };
+    let audit_body = if private {
+        format!(
+            "memory_id={} from_scope={} to_scope={} by={by}",
+            memory.id, memory.scope, to_scope
+        )
+    } else {
+        format!(
+            "memory_id={} owner={} title={} from_scope={} to_scope={}",
+            memory.id, memory.owner, memory.title, memory.scope, to_scope
+        )
+    };
     conn.execute(
-        "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
-         VALUES(?1, ?2, 'promotion', ?3, ?4, ?5, ?6)",
+        "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path, visibility)
+         VALUES(?1, ?2, 'promotion', ?3, ?4, ?5, ?6, ?7)",
         params![
             Utc::now().to_rfc3339(),
-            by,
+            if private { &memory.owner } else { &by },
             summary,
-            format!(
-                "memory_id={} owner={} title={} from_scope={} to_scope={}",
-                memory.id, memory.owner, memory.title, memory.scope, to_scope
-            ),
+            audit_body,
             to_scope,
-            memory.source_path
+            if private { "" } else { &memory.source_path },
+            if private { Some("private") } else { None },
         ],
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     let audit_id = conn.last_insert_rowid();
     conn.execute(
         "INSERT INTO episodes_fts(rowid, summary, body) VALUES(?1, ?2, ?3)",
-        params![
-            audit_id,
-            summary,
-            format!(
-                "memory_id={} owner={} title={} from_scope={} to_scope={}",
-                memory.id, memory.owner, memory.title, memory.scope, to_scope
-            )
-        ],
+        params![audit_id, summary, audit_body],
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
 
     Ok(PromoteOutcome {
@@ -229,14 +265,20 @@ pub fn promote(conn: &Connection, id: i64, to_scope: &str, by: &str) -> Result<P
     })
 }
 
-fn graduation_memories(conn: &Connection) -> Result<Vec<MemoryForGraduation>> {
+fn graduation_memories(conn: &Connection, reader: &str) -> Result<Vec<MemoryForGraduation>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, title, owner, scope, is_lock, status, coalesce(source_path, '')
          FROM memories",
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     let rows = stmt.query_map([], row_memory_for_graduation)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut visible = Vec::new();
+    for row in rows {
+        let memory = row?;
+        if acl::can_read_row(conn, "memory", memory.id, reader)? {
+            visible.push(memory)
+        }
+    }
+    Ok(visible)
 }
 
 fn memory_by_id(conn: &Connection, id: i64) -> Result<Option<MemoryForGraduation>> {
@@ -452,6 +494,30 @@ mod tests {
     use crate::{parser::MemoryDoc, schema};
     use proptest::prelude::*;
     use std::path::Path;
+    use tempfile::TempDir;
+
+    #[test]
+    fn consolidate_default_reader_writes_a_filtered_report() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let previous = std::env::var_os("AIOS_ROOT");
+        let root = TempDir::new().unwrap();
+        unsafe { std::env::set_var("AIOS_ROOT", root.path()) };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        insert_memory(&conn, "private-cold", "Private Cold", "company", false);
+        conn.execute(
+            "UPDATE memories SET visibility='private', owner='agent:a'",
+            [],
+        )
+        .unwrap();
+        let report = consolidate(&conn, false).unwrap();
+        assert!(report.candidates.is_empty());
+        assert!(Path::new(report.report_path.as_deref().unwrap()).exists());
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AIOS_ROOT", value) }, // LCOV_EXCL_LINE: cleanup depends on caller's ambient environment; absent branch is asserted.
+            None => unsafe { std::env::remove_var("AIOS_ROOT") },
+        }
+    }
 
     #[test]
     fn consolidate_nominates_promotion_and_cooling_but_exempts_locks() {
@@ -661,6 +727,8 @@ mod tests {
             body: format!("{title} body"),
             owner: "shared".to_string(),
             scope: scope.to_string(),
+            memory_type: "memory".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/memory.md").to_path_buf(),
             content_hash: format!("hash-{name}"),
             is_lock,

@@ -7,7 +7,10 @@ use serde::Deserialize;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 const LOCALE_VERSION: u32 = 1;
-const BUNDLED_PACKS: &[(&str, &str)] = &[("es.toml", include_str!("../locales/es.toml"))];
+const BUNDLED_PACKS: &[(&str, &str)] = &[
+    ("generic.toml", include_str!("../locales/generic.toml")),
+    ("es.toml", include_str!("../locales/es.toml")),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryIntent {
@@ -45,6 +48,7 @@ struct LocalePack {
     orientation_patterns: Vec<String>,
     rule_patterns: Vec<String>,
     terms: BTreeMap<String, Vec<String>>,
+    synonyms: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,8 @@ struct LocaleFile {
     intents: IntentFile,
     #[serde(default)]
     terms: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    synonyms: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -132,6 +138,26 @@ impl LocaleRegistry {
                         if seen.insert(target.as_str()) {
                             expansions.push(target.as_str());
                         }
+                    }
+                }
+            }
+            for (concept, members) in &pack.synonyms {
+                let matched = members
+                    .iter()
+                    .filter(|member| contains_phrase(&normalized_query, member))
+                    .collect::<Vec<_>>();
+                if matched.is_empty() {
+                    continue;
+                }
+                for member in matched {
+                    mark_covered_tokens(&query_tokens, member, &mut covered_tokens);
+                }
+                if primary_seen.insert(concept.as_str()) {
+                    primary_expansions.push(concept.as_str());
+                }
+                for member in members {
+                    if seen.insert(member.as_str()) {
+                        expansions.push(member.as_str());
                     }
                 }
             }
@@ -234,6 +260,7 @@ impl LocaleRegistry {
             )?,
             rule_patterns: normalize_values(name, "rule pattern", parsed.intents.rule)?,
             terms: normalize_terms(name, parsed.terms)?,
+            synonyms: normalize_synonyms(name, parsed.synonyms)?,
         };
         if let Some(existing) = self
             .packs
@@ -274,6 +301,14 @@ fn merge_pack(name: &str, existing: &mut LocalePack, extension: LocalePack) -> R
             );
         }
     }
+    for (concept, members) in extension.synonyms {
+        if existing.synonyms.insert(concept.clone(), members).is_some() {
+            bail!(
+                "locale pack {name} redefines synonym group {concept:?} for locale {}",
+                existing.locale
+            ); // LCOV_EXCL_LINE: error text is asserted by the merge-conflict test.
+        } // LCOV_EXCL_LINE: merge-conflict branch is asserted by the adjacent test.
+    }
     Ok(())
 }
 
@@ -311,6 +346,33 @@ fn normalize_terms(
         }
         if normalized.insert(source.clone(), targets).is_some() {
             bail!("locale pack {name} repeats normalized term {source:?}");
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_synonyms(
+    name: &str,
+    groups: BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut normalized = BTreeMap::new();
+    for (concept, members) in groups {
+        let concept = normalize(&concept);
+        if concept.is_empty() {
+            bail!("locale pack {name} has an empty synonym concept");
+        }
+        let members = normalize_values(name, "synonym", members)?;
+        if members.is_empty() {
+            bail!("locale pack {name} synonym group {concept:?} has no members");
+        }
+        let mut complete = vec![concept.clone()];
+        for member in members {
+            if !complete.contains(&member) {
+                complete.push(member);
+            }
+        }
+        if normalized.insert(concept.clone(), complete).is_some() {
+            bail!("locale pack {name} repeats synonym group {concept:?}");
         }
     }
     Ok(normalized)
@@ -379,6 +441,7 @@ fn legacy_intent(query: &str) -> QueryIntent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use tempfile::tempdir;
 
     #[test]
@@ -401,6 +464,26 @@ mod tests {
         assert!(compactor.search_text.contains("attacks"));
         assert!(compactor.search_text.contains("summary"));
         assert!(compactor.search_text.contains("first"));
+    }
+
+    #[test]
+    fn bundled_synonyms_bridge_generic_english_and_spanish_at_query_time() {
+        let registry = LocaleRegistry::bundled().unwrap();
+
+        let education = registry.prepare("compare college paths");
+        for term in ["education", "university", "degree", "associate", "school"] {
+            assert!(education.search_text.contains(term), "missing {term:?}");
+        }
+        assert_eq!(education.topic_text, "education compare paths");
+
+        let money = registry.prepare("revisar presupuesto");
+        for term in ["money", "budget", "finance", "accounts", "bills"] {
+            assert!(money.search_text.contains(term), "missing {term:?}");
+        }
+
+        let meeting = registry.prepare("preparar reunión");
+        assert!(meeting.search_text.contains("meeting"));
+        assert!(meeting.search_text.contains("session"));
     }
 
     #[test]
@@ -456,5 +539,144 @@ mod tests {
         .unwrap();
         let error = LocaleRegistry::from_dir(dir.path()).unwrap_err();
         assert!(error.to_string().contains("uses version 2"));
+    }
+
+    #[test]
+    fn installed_registry_loads_extensions_and_rejects_an_empty_path() {
+        let _lock = crate::test_env_lock().lock().unwrap();
+        let previous = std::env::var_os("SHELVES_LOCALE_DIR");
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("extension.toml"),
+            "version = 1\nlocale = \"zz\"\n[terms]\nhello = [\"world\"]\n",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("SHELVES_LOCALE_DIR", dir.path()) };
+        assert_eq!(
+            LocaleRegistry::installed()
+                .unwrap()
+                .prepare("hello")
+                .search_text,
+            "world"
+        );
+
+        unsafe { std::env::set_var("SHELVES_LOCALE_DIR", OsString::new()) };
+        assert!(
+            LocaleRegistry::installed()
+                .unwrap_err()
+                .to_string()
+                .contains("set but empty")
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("SHELVES_LOCALE_DIR", value) }, // LCOV_EXCL_LINE: cleanup depends on caller's ambient environment.
+            None => unsafe { std::env::remove_var("SHELVES_LOCALE_DIR") },
+        }
+    }
+
+    #[test]
+    fn directory_extensions_merge_unique_values_and_ignore_other_files() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("README.txt"), "ignored").unwrap();
+        std::fs::write(
+            dir.path().join("aa.toml"),
+            "version = 1\nlocale = \"zz\"\nstopwords = [\"the\"]\n[intents]\norientation = [\"where now\"]\nrule = [\"must do\"]\n[terms]\nhello = [\"world\"]\n[synonyms]\neducation = [\"college\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("ab.toml"),
+            "version = 1\nlocale = \"zz\"\nstopwords = [\"and\"]\n[intents]\norientation = [\"status now\"]\nrule = [\"required now\"]\n[terms]\nfriend = [\"ally\"]\n",
+        )
+        .unwrap();
+
+        let registry = LocaleRegistry::from_dir(dir.path()).unwrap();
+        assert_eq!(
+            registry.prepare("the hello and friend").search_text,
+            "ally world"
+        );
+        assert_eq!(
+            registry.prepare("status now").intent,
+            QueryIntent::Orientation
+        );
+        assert_eq!(registry.prepare("required now").intent, QueryIntent::Rule);
+        assert_eq!(registry.prepare("college").search_text, "education college");
+    }
+
+    #[test]
+    fn locale_validation_reports_each_invalid_shape() {
+        let cases = [
+            ("version = 1\nlocale = \" \"\n", "empty locale"),
+            (
+                "version = 1\nlocale = \"zz\"\n[intents]\norientation = [\" \" ]\n",
+                "empty orientation pattern",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\nstopwords = [\" \" ]\n",
+                "empty stopword",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\n[terms]\n\" \" = [\"target\"]\n",
+                "empty expansion source",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\n[terms]\nsource = []\n",
+                "has no expansion targets",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\n[terms]\na = [\"one\"]\n\"á\" = [\"two\"]\n",
+                "repeats normalized term",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\n[synonyms]\neducation = []\n",
+                "has no members",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\n[synonyms]\n\" \" = [\"college\"]\n",
+                "empty synonym concept",
+            ),
+            (
+                "version = 1\nlocale = \"zz\"\n[synonyms]\na = [\"one\"]\n\"á\" = [\"two\"]\n",
+                "repeats synonym group",
+            ),
+        ];
+        for (contents, expected) in cases {
+            let mut registry = LocaleRegistry::empty();
+            let error = registry.add_toml("invalid.toml", contents).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
+
+        let mut registry = LocaleRegistry::empty();
+        registry
+            .add_toml(
+                "first.toml",
+                "version = 1\nlocale = \"zz\"\n[terms]\nhello = [\"world\"]\n",
+            )
+            .unwrap();
+        let error = registry
+            .add_toml(
+                "second.toml",
+                "version = 1\nlocale = \"zz\"\n[terms]\nhello = [\"again\"]\n",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("redefines term"));
+
+        let mut registry = LocaleRegistry::empty();
+        registry
+            .add_toml(
+                "first.toml",
+                "version = 1\nlocale = \"zz\"\n[synonyms]\neducation = [\"college\"]\n",
+            )
+            .unwrap();
+        let error = registry
+            .add_toml(
+                "second.toml",
+                "version = 1\nlocale = \"zz\"\n[synonyms]\neducation = [\"school\"]\n",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("redefines synonym group"));
     }
 }

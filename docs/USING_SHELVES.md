@@ -22,6 +22,9 @@ target/release/shelves ingest --reset --force
 target/release/shelves search "checkout retry" --scope company
 target/release/shelves context planner "write checkout retry tests"
 target/release/shelves ask archivist "release checklist" --as agent:planner
+target/release/shelves grant planner reviewer --include-private
+target/release/shelves grants --json
+target/release/shelves revoke planner reviewer
 target/release/shelves missed "retry owner did not appear" --by engineer
 target/release/shelves misses list --since 7
 target/release/shelves lock show checkout-retry-rule
@@ -35,10 +38,30 @@ Scopes fall through from product to company to OS. Company searches can also
 consider product rows; OS searches can consider company rows. Scope controls
 retrieval distance only.
 
-Owners and ACL rows are independent of scope. Shared/self reads always pass,
-explicit reader rows override wildcard rows, wildcard rows apply next, and no
-matching ACL row means allowed. `--as` is unverified caller input, so use these
-controls only inside a trusted local workspace.
+Owners, visibility, and ACL rows are independent of scope. Mark a Markdown
+memory or episode file with YAML frontmatter to close its derived rows:
+
+```yaml
+---
+owner: planner
+visibility: private
+---
+# Planning note
+```
+
+The owner can read a private row. Other readers need an explicit owner or row
+grant with `--include-private`; an ordinary grant or wildcard does not expose
+it. `grant planner reviewer --row 3 --kind memory --include-private` limits a
+grant to one indexed memory. `revoke` removes a grant, and `grants --json`
+lists the append-only audit. A reset refuses while row grants exist because
+recreated IDs might identify different rows.
+
+Unmarked rows use `default_visibility` in the SQLite `meta` table, initially
+`shared`; an invalid explicit marker closes the row. Shared rows use the older
+owner ACL: self reads pass, explicit reader rows override wildcard rows, and
+no matching ACL row means allowed. `--as` and grant actors are unverified local
+CLI inputs. The source files and database need normal filesystem protection;
+the CLI read policy is not an authentication or multi-tenant boundary.
 
 ## Source configuration
 

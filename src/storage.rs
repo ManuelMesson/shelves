@@ -23,6 +23,7 @@ pub struct Stats {
     pub cold_memories: i64,
     pub memories_by_scope: BTreeMap<String, i64>,
     pub memories_by_owner: BTreeMap<String, i64>,
+    pub memories_by_type: BTreeMap<String, i64>,
     pub memories_by_status: BTreeMap<String, i64>,
     pub episodes_by_kind: BTreeMap<String, i64>,
     pub last_ingest_ts: Option<String>,
@@ -79,11 +80,15 @@ impl EpisodeDeduper {
         }
         let identity = EpisodeIdentity::from_doc(doc);
         if self.identities.contains(&identity) {
+            conn.execute(
+                "UPDATE episodes SET visibility=?1 WHERE source_path=?2 AND summary=?3 AND body=?4 AND visibility IS NOT ?1",
+                params![doc.visibility, identity.source_path, identity.summary, identity.body],
+            )?; // LCOV_EXCL_LINE: successful visibility update asserted by reingest test.
             return Ok(None);
         }
         conn.execute(
-            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO episodes(ts, actor, kind, summary, body, scope, source_path, visibility)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 doc.ts,
                 doc.actor,
@@ -91,7 +96,8 @@ impl EpisodeDeduper {
                 doc.summary,
                 doc.body,
                 doc.scope,
-                doc.source_path.to_string_lossy()
+                doc.source_path.to_string_lossy(),
+                doc.visibility
             ],
         )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         let id = conn.last_insert_rowid();
@@ -166,18 +172,23 @@ pub fn set_last_ingest(conn: &Connection) -> Result<()> {
 }
 
 pub fn upsert_memory(conn: &Connection, doc: &MemoryDoc) -> Result<i64> {
-    let existing: Option<(i64, String, String)> = conn
+    let existing: Option<(i64, String, String, String, Option<String>)> = conn
         .query_row(
-            "SELECT id, content_hash, status FROM memories WHERE name = ?1",
+            "SELECT id, content_hash, status, memory_type, visibility FROM memories WHERE name = ?1",
             params![doc.name],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    if let Some((id, hash, status)) = existing {
-        if hash != doc.content_hash || status == "archived" {
+    if let Some((id, hash, status, memory_type, visibility)) = existing {
+        if hash != doc.content_hash
+            || status == "archived"
+            || memory_type != doc.memory_type
+            || visibility != doc.visibility
+        {
             conn.execute(
                 "UPDATE memories SET title=?1, body=?2, owner=?3, scope=?4, source_path=?5,
-                 content_hash=?6, is_lock=?7, status='hot', updated_at=?8 WHERE id=?9",
+                 content_hash=?6, is_lock=?7, memory_type=?8, status='hot', updated_at=?9,
+                 visibility=?10 WHERE id=?11",
                 params![
                     doc.title,
                     doc.body,
@@ -186,7 +197,9 @@ pub fn upsert_memory(conn: &Connection, doc: &MemoryDoc) -> Result<i64> {
                     doc.source_path.to_string_lossy(),
                     doc.content_hash,
                     doc.is_lock as i64,
+                    doc.memory_type,
                     doc.updated_at,
+                    doc.visibility,
                     id
                 ],
             )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
@@ -195,19 +208,21 @@ pub fn upsert_memory(conn: &Connection, doc: &MemoryDoc) -> Result<i64> {
     }
 
     conn.execute(
-        "INSERT INTO memories(name, title, body, owner, scope, source_path, content_hash, is_lock, created_at, updated_at)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO memories(name, title, body, owner, scope, memory_type, source_path, content_hash, is_lock, created_at, updated_at, visibility)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             doc.name,
             doc.title,
             doc.body,
             doc.owner,
             doc.scope,
+            doc.memory_type,
             doc.source_path.to_string_lossy(),
             doc.content_hash,
             doc.is_lock as i64,
             doc.created_at,
-            doc.updated_at
+            doc.updated_at,
+            doc.visibility
         ],
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     Ok(conn.last_insert_rowid())
@@ -446,6 +461,10 @@ pub fn stats(conn: &Connection, source_files: &[PathBuf]) -> Result<Stats> {
             conn,
             "SELECT owner, COUNT(*) FROM memories GROUP BY owner",
         )?, // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
+        memories_by_type: grouped_counts(
+            conn,
+            "SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type",
+        )?, // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         memories_by_status: grouped_counts(
             conn,
             "SELECT status, COUNT(*) FROM memories GROUP BY status",
@@ -555,6 +574,8 @@ mod tests {
             body: body.to_string(),
             owner: "shared".to_string(),
             scope: "company".to_string(),
+            memory_type: "memory".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/test-memory.md").to_path_buf(),
             content_hash: format!("hash-{name}-{body}"),
             is_lock: false,
@@ -571,8 +592,39 @@ mod tests {
             summary: summary.to_string(),
             body: body.to_string(),
             scope: "company".to_string(),
+            visibility: None,
             source_path: Path::new("/tmp/test-episode.md").to_path_buf(),
         }
+    }
+
+    #[test]
+    fn reingest_updates_visibility_without_changing_row_identity() {
+        let conn = test_conn();
+        let mut memory = memory_doc("m", "M", "same body");
+        let id = upsert_memory(&conn, &memory).unwrap();
+        memory.visibility = Some("private".to_string());
+        assert_eq!(upsert_memory(&conn, &memory).unwrap(), id);
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT visibility FROM memories WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("private"));
+
+        let mut episode = episode_doc("ticket", "Same", "same body");
+        let episode_id = insert_episode_if_new(&conn, &episode).unwrap().unwrap();
+        episode.visibility = Some("private".to_string());
+        assert_eq!(insert_episode_if_new(&conn, &episode).unwrap(), None);
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT visibility FROM episodes WHERE id=?1",
+                params![episode_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("private"));
     }
 
     #[test]

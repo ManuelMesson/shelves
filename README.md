@@ -17,6 +17,8 @@ not tied to a model provider.
   editing their bodies.
 - Product, company, and OS retrieval scopes with documented fall-through.
 - Agent-owned memory rows and configurable read filtering.
+- Per-row `visibility: private` with explicit private grants and an append-only
+  grant audit.
 - A required protected-root guard that refuses a configured path before file
   walking.
 - Miss logging, miss review, and hermetic golden regressions.
@@ -33,18 +35,26 @@ os             -> company
 ```
 
 Agent association lives in the separate `owner` field, such as
-`agent:planner`. Read filtering is handled by `node_acl`:
+`agent:planner`. `visibility` is a separate property on indexed memories and
+episodes:
 
-- `shared` rows and a caller's own rows are readable.
-- An explicit reader grant or revoke wins.
-- A wildcard rule applies when no explicit reader rule exists.
-- With no matching rule, access is allowed by default.
+- `visibility: private` rows are readable by the owner. Another reader needs
+  an explicit `grant OWNER READER --include-private`, optionally limited to a
+  row with `--row ID --kind memory|episode`. Ordinary owner grants and wildcard
+  rules do not expose private rows.
+- Unmarked rows use the stored `default_visibility` setting, initially
+  `shared`. An invalid explicit visibility marker is treated as `private`.
+- Shared rows use the owner ACL: an explicit reader rule wins over a wildcard;
+  with no matching rule, the owner ACL is open by default. An explicit revoke
+  can close that path.
+- `grant`, `revoke`, and `grants` record changes in an append-only audit.
+  A reset refuses to rebind existing row grants to new numeric IDs.
 
-The caller supplies `--as`; Shelves does not authenticate that identity. The
-ACL is therefore a configurable retrieval policy for a trusted local workspace,
-not a privacy, authorization, or multi-tenant security boundary. The
-protected-root guard prevents indexing one configured filesystem tree; it does
-not create private agent storage.
+The caller supplies `--as`; Shelves does not authenticate that identity or
+protect the Markdown source files or SQLite database from local readers. These
+read rules are for a trusted local workspace, not a multi-tenant security
+boundary. The protected-root guard prevents indexing one configured filesystem
+tree; it does not create private filesystem storage.
 
 ## Install and quickstart
 
@@ -71,7 +81,7 @@ target/release/shelves context planner "write checkout retry tests"
 ```
 
 See [Using Shelves](docs/USING_SHELVES.md) for sources, commands, locale packs,
-and the ACL contract.
+and the visibility/ACL contract.
 
 ## Verify a clone
 
@@ -87,8 +97,9 @@ PATH="$PWD/.venv/bin:$PATH" ./scripts/check.sh
 
 The last line is the single repository gate. It runs format, Clippy with
 warnings denied, all Rust tests, Ruff, Python tests, the public-content/path
-guard, and `cargo audit`. The same subcommands are named as separate steps in
-`.github/workflows/ci.yml` so a failing check is visible.
+guard, and `cargo audit`. The workflow in `.github/workflows/ci.yml` invokes
+the same checks on GitHub-hosted runners. Run status depends on GitHub Actions
+availability for the repository.
 
 ## Configuration
 

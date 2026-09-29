@@ -1,0 +1,9 @@
+version = 1
+locale = "generic"
+
+# Small deterministic query-time bridges. These groups are deliberately generic;
+# deployments add company vocabulary through SHELVES_LOCALE_DIR.
+[synonyms]
+education = ["college", "university", "degree", "associate", "school", "universidad"]
+money = ["budget", "finance", "accounts", "bills", "presupuesto"]
+meeting = ["meeting", "reunión", "session"]

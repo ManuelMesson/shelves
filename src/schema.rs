@@ -1,5 +1,5 @@
-use anyhow::Result;
-use rusqlite::{Connection, params};
+use anyhow::{Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{CONTRACT_VERSION, SCHEMA_VERSION};
 
@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS memories (
   body         TEXT NOT NULL,
   owner        TEXT NOT NULL,
   scope        TEXT NOT NULL,
+  memory_type  TEXT NOT NULL DEFAULT 'memory',
+  visibility   TEXT,
   source_path  TEXT,
   content_hash TEXT NOT NULL,
   is_lock      INTEGER NOT NULL DEFAULT 0,
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS episodes (
   summary     TEXT NOT NULL,
   body        TEXT,
   scope       TEXT NOT NULL,
+  visibility  TEXT,
   source_path TEXT
 );
 
@@ -80,7 +83,29 @@ CREATE TABLE IF NOT EXISTS node_acl (
   owner_node TEXT NOT NULL,
   reader     TEXT NOT NULL,
   granted    INTEGER NOT NULL DEFAULT 1,
+  include_private INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (owner_node, reader)
+);
+
+CREATE TABLE IF NOT EXISTS row_acl (
+  row_kind TEXT NOT NULL,
+  row_id INTEGER NOT NULL,
+  owner_node TEXT NOT NULL,
+  reader TEXT NOT NULL,
+  include_private INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (row_kind, row_id, reader)
+);
+
+CREATE TABLE IF NOT EXISTS grant_audit (
+  id INTEGER PRIMARY KEY,
+  ts TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  owner_node TEXT NOT NULL,
+  reader TEXT NOT NULL,
+  row_kind TEXT,
+  row_id INTEGER,
+  include_private INTEGER NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(title, body, content='memories', content_rowid='id');
@@ -89,12 +114,62 @@ CREATE VIRTUAL TABLE IF NOT EXISTS locks_fts USING fts5(slug, title, body, conte
 "#,
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
 
+    ensure_memory_type_column(conn)?;
+    ensure_column(conn, "memories", "visibility", "TEXT")?;
+    ensure_column(conn, "episodes", "visibility", "TEXT")?;
+    ensure_column(
+        conn,
+        "node_acl",
+        "include_private",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?; // LCOV_EXCL_LINE: successful legacy node ACL migration asserted by schema migration test.
     seed_meta(conn)?;
     rebuild_locks_fts(conn)?;
     Ok(())
 }
 
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?; // LCOV_EXCL_LINE: successful additive ALTER asserted by legacy migration test.
+    }
+    Ok(())
+}
+
+fn ensure_memory_type_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "memory_type") {
+        conn.execute(
+            "ALTER TABLE memories ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'memory'",
+            [],
+        )?; // LCOV_EXCL_LINE: fallible migration boundary; success is asserted by the legacy-schema test.
+    }
+    Ok(())
+}
+
 pub fn reset_db(conn: &Connection) -> Result<()> {
+    let row_grants: i64 = conn.query_row("SELECT COUNT(*) FROM row_acl", [], |row| row.get(0))?;
+    if row_grants > 0 {
+        bail!(
+            "ingest --reset cannot safely rebind row grants; use incremental ingest or revoke row grants first"
+        );
+    }
+    let default_visibility: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='default_visibility'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
     conn.execute_batch(
         r#"
 DROP TABLE IF EXISTS memories_fts;
@@ -104,13 +179,19 @@ DROP TABLE IF EXISTS recall_events;
 DROP TABLE IF EXISTS future_items;
 DROP TABLE IF EXISTS links;
 DROP TABLE IF EXISTS locks;
-DROP TABLE IF EXISTS node_acl;
 DROP TABLE IF EXISTS memories;
 DROP TABLE IF EXISTS episodes;
 DROP TABLE IF EXISTS meta;
 "#,
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
-    init_db(conn)
+    init_db(conn)?;
+    if let Some(value) = default_visibility {
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='default_visibility'",
+            params![value],
+        )?; // LCOV_EXCL_LINE: successful reset restoration asserted by private grant migration test.
+    } // LCOV_EXCL_LINE: reset branch restoration asserted by private-grant migration test.
+    Ok(())
 }
 
 fn seed_meta(conn: &Connection) -> Result<()> {
@@ -122,11 +203,15 @@ fn seed_meta(conn: &Connection) -> Result<()> {
         // after mtime seeding with d=0.5: ln(30^-0.5) ~= -1.70.
         ("hot_threshold", "-1.6"),
         ("rank_episode_weight", "0.55"),
+        ("rank_reference_weight", "1.08"),
         // Lock shelves-english-primary-agents-translate: OR fallback must clear a real-match floor.
         ("real_match_floor", "0.50"),
         ("context_default_budget", "15"),
         // Context treats the budget as a cap; task-specific tail rows must clear this relevance floor.
         ("context_relevance_floor", "0.66"),
+        // Query terms present in more than this share of readable memories and locks
+        // do not establish task relevance on their own.
+        ("context_max_term_document_frequency", "0.25"),
         // Archivist's consolidate pass nominates a promotion once a memory has
         // been recalled at least this many times from a broader scope.
         ("promotion_recall_threshold", "2"),
@@ -138,6 +223,10 @@ fn seed_meta(conn: &Connection) -> Result<()> {
             params![key, value],
         )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('default_visibility', 'shared') ON CONFLICT(key) DO NOTHING",
+        [],
+    )?; // LCOV_EXCL_LINE: successful seed asserted by default-visibility meta test.
     Ok(())
 }
 
@@ -213,6 +302,41 @@ mod tests {
     }
 
     #[test]
+    fn init_db_adds_memory_type_to_existing_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                source_path TEXT,
+                content_hash TEXT NOT NULL,
+                is_lock INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'hot',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO memories(name, title, body, owner, scope, content_hash, created_at, updated_at)
+             VALUES('legacy', 'Legacy', 'body', 'shared', 'company', 'hash', '2026-01-01', '2026-01-01');",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let memory_type: String = conn
+            .query_row(
+                "SELECT memory_type FROM memories WHERE name='legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_type, "memory");
+    }
+
+    #[test]
     fn seed_meta_inserts_documented_defaults_and_reinit_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -223,10 +347,13 @@ mod tests {
             ("decay_d", "0.5"),
             ("hot_threshold", "-1.6"),
             ("rank_episode_weight", "0.55"),
+            ("rank_reference_weight", "1.08"),
             ("real_match_floor", "0.50"),
             ("context_default_budget", "15"),
             ("context_relevance_floor", "0.66"),
+            ("context_max_term_document_frequency", "0.25"),
             ("promotion_recall_threshold", "2"),
+            ("default_visibility", "shared"),
         ];
         for (key, value) in expected {
             let actual: String = conn
@@ -241,7 +368,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM meta", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 9);
+        assert_eq!(count, 12);
 
         conn.execute(
             "UPDATE meta SET value = 'changed' WHERE key = 'decay_d'",
@@ -259,7 +386,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM meta", [], |row| row.get(0))
             .unwrap();
         assert_eq!(decay, "0.5");
-        assert_eq!(count_after_reinit, 9);
+        assert_eq!(count_after_reinit, 12);
     }
 
     #[test]
@@ -312,6 +439,79 @@ mod tests {
         assert!(names.contains("memories_fts"));
         assert!(names.contains("episodes_fts"));
         assert!(names.contains("locks_fts"));
+    }
+
+    #[test]
+    fn legacy_tables_gain_visibility_and_private_grants_survive_safe_reset() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories(id INTEGER PRIMARY KEY, name TEXT, title TEXT, body TEXT,
+                owner TEXT, scope TEXT, content_hash TEXT, created_at TEXT, updated_at TEXT);
+             CREATE TABLE episodes(id INTEGER PRIMARY KEY, ts TEXT, actor TEXT, kind TEXT,
+                summary TEXT, body TEXT, scope TEXT, source_path TEXT);
+             CREATE TABLE node_acl(owner_node TEXT, reader TEXT, granted INTEGER,
+                PRIMARY KEY(owner_node,reader));
+             INSERT INTO node_acl VALUES('agent:a','agent:b',1);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        for table in ["memories", "episodes"] {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(cols.contains(&"visibility".to_string()));
+        }
+        let private: i64 = conn.query_row(
+            "SELECT include_private FROM node_acl WHERE owner_node='agent:a' AND reader='agent:b'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(private, 0);
+        conn.execute("UPDATE node_acl SET include_private=1", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE meta SET value='private' WHERE key='default_visibility'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO grant_audit(ts,actor,action,owner_node,reader,include_private)
+            VALUES('2026-01-01','agent:a','grant','agent:a','agent:b',1)",
+            [],
+        )
+        .unwrap();
+        reset_db(&conn).unwrap();
+        let (private, default): (i64, String) = (
+            conn.query_row("SELECT include_private FROM node_acl", [], |r| r.get(0))
+                .unwrap(),
+            conn.query_row(
+                "SELECT value FROM meta WHERE key='default_visibility'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!((private, default.as_str()), (1, "private"));
+        let audits: i64 = conn
+            .query_row("SELECT COUNT(*) FROM grant_audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(audits, 1);
+        conn.execute(
+            "INSERT INTO row_acl(row_kind,row_id,owner_node,reader,include_private)
+            VALUES('memory',1,'agent:a','agent:b',1)",
+            [],
+        )
+        .unwrap();
+        assert!(reset_db(&conn).is_err());
+        let still_present: i64 = conn
+            .query_row("SELECT COUNT(*) FROM row_acl", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still_present, 1);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use rusqlite::params;
 use serde::Serialize;
 
 use crate::{
-    DbPathResolution, answer, graduation, guard, ingest, is_default_db_path, locks,
+    DbPathResolution, acl, answer, graduation, guard, ingest, is_default_db_path, locks,
     resolve_db_path, search, storage, workspace_root,
 };
 
@@ -37,12 +37,18 @@ enum Commands {
     Search(SearchArgs),
     /// Query another agent node.
     Ask(AskArgs),
+    /// Grant a reader access to an owner or one indexed row.
+    Grant(GrantArgs),
+    /// Revoke a reader's explicit access.
+    Revoke(GrantArgs),
+    /// List the append-only grant audit.
+    Grants(OutputArgs),
     /// Show dated episodes.
     Timeline(TimelineArgs),
     /// Show today's episodes.
-    Today(OutputArgs),
+    Today(TimelineOutputArgs),
     /// Show yesterday's episodes.
-    Yesterday(OutputArgs),
+    Yesterday(TimelineOutputArgs),
     /// List open future items.
     Upcoming(UpcomingArgs),
     /// Store a future memory item.
@@ -64,7 +70,7 @@ enum Commands {
     /// Apply a ratified scope graduation.
     Promote(PromoteArgs),
     /// Report cooling candidates without deleting anything.
-    PruneReport(OutputArgs),
+    PruneReport(TimelineOutputArgs),
     /// Manage write-once Lock-It records.
     Lock(LockArgs),
     /// Print table, scope, owner, status, and staleness counts.
@@ -147,6 +153,8 @@ struct DoneArgs {
 #[derive(Debug, Args)]
 struct RelatedArgs {
     name: String,
+    #[arg(long = "as", default_value = "agent:builder")]
+    as_agent: String,
     #[arg(long)]
     json: bool,
 }
@@ -291,8 +299,32 @@ struct TimelineArgs {
     from: Option<String>,
     #[arg(long = "to")]
     to: Option<String>,
+    #[arg(long = "as", default_value = "agent:builder")]
+    as_agent: String,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TimelineOutputArgs {
+    #[arg(long = "as", default_value = "agent:builder")]
+    as_agent: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct GrantArgs {
+    owner: String,
+    reader: String,
+    #[arg(long)]
+    row: Option<i64>,
+    #[arg(long, default_value = "memory")]
+    kind: String,
+    #[arg(long)]
+    include_private: bool,
+    #[arg(long)]
+    by: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -321,6 +353,8 @@ struct DedupeEpisodesArgs {
 struct ConsolidateArgs {
     #[arg(long)]
     at_close: bool,
+    #[arg(long = "as", default_value = "agent:builder")]
+    as_agent: String,
     #[arg(long)]
     json: bool,
 }
@@ -344,6 +378,56 @@ struct EpisodeRow {
     summary: String,
     scope: String,
     source_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GrantAuditRow {
+    ts: String,
+    actor: String,
+    action: String,
+    owner: String,
+    reader: String,
+    row_kind: Option<String>,
+    row_id: Option<i64>,
+    include_private: bool,
+}
+
+fn normalize_acl_agent(value: &str) -> String {
+    let lowered = value.trim().to_ascii_lowercase();
+    let value = lowered.trim_start_matches("agent:");
+    if value == "shared" {
+        value.to_string()
+    } else {
+        format!("agent:{value}")
+    }
+}
+
+fn change_grant(db: &DbPathResolution, args: GrantArgs, revoke: bool) -> Result<()> {
+    let conn = storage::open(&db.path)?;
+    let owner = normalize_acl_agent(&args.owner);
+    let reader = normalize_acl_agent(&args.reader);
+    let actor = args
+        .by
+        .as_deref()
+        .map(normalize_acl_agent)
+        .unwrap_or_else(|| owner.clone());
+    acl::change_grant(
+        &conn,
+        &owner,
+        &reader,
+        args.row,
+        &args.kind,
+        args.include_private,
+        revoke,
+        &actor,
+    )?; // LCOV_EXCL_LINE: successful audited grant asserted by CLI grant golden.
+    println!(
+        "{} recorded for {} → {}",
+        if revoke { "revoke" } else { "grant" },
+        owner,
+        reader
+    );
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -391,7 +475,7 @@ fn run() -> Result<()> {
                 &query,
                 &args.scope,
                 args.owner.as_deref(),
-                &args.as_agent,
+                &normalize_acl_agent(&args.as_agent),
                 args.include_cold,
                 10,
             )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
@@ -413,6 +497,43 @@ fn run() -> Result<()> {
                 10,
             )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
             print_hits(hits, args.json)?;
+        }
+        Some(Commands::Grant(args)) => change_grant(&db, args, false)?,
+        Some(Commands::Revoke(args)) => change_grant(&db, args, true)?,
+        Some(Commands::Grants(args)) => {
+            let conn = storage::open(&db.path)?;
+            let mut stmt = conn.prepare("SELECT ts, actor, action, owner_node, reader, row_kind, row_id, include_private FROM grant_audit ORDER BY id")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(GrantAuditRow {
+                        ts: r.get(0)?,
+                        actor: r.get(1)?,
+                        action: r.get(2)?,
+                        owner: r.get(3)?,
+                        reader: r.get(4)?,
+                        row_kind: r.get(5)?,
+                        row_id: r.get(6)?,
+                        include_private: r.get::<_, i64>(7)? != 0,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                for row in rows {
+                    println!(
+                        "{} {} by {}: {} → {} row={:?}:{:?} include-private={}",
+                        row.ts,
+                        row.action,
+                        row.actor,
+                        row.owner,
+                        row.reader,
+                        row.row_kind,
+                        row.row_id,
+                        row.include_private
+                    );
+                }
+            }
         }
         Some(Commands::Upcoming(args)) => {
             let conn = storage::open(&db.path)?;
@@ -465,7 +586,7 @@ fn run() -> Result<()> {
         }
         Some(Commands::Related(args)) => {
             let conn = storage::open(&db.path)?;
-            let rows = answer::related(&conn, &args.name)?;
+            let rows = answer::related_as(&conn, &args.name, &normalize_acl_agent(&args.as_agent))?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else if rows.is_empty() {
@@ -524,11 +645,23 @@ fn run() -> Result<()> {
         },
         Some(Commands::Timeline(args)) => {
             let (from, to) = timeline_bounds(&args)?;
-            print_timeline(&db, from, to, args.json)?;
+            print_timeline(
+                &db,
+                from,
+                to,
+                &normalize_acl_agent(&args.as_agent),
+                args.json,
+            )?; // LCOV_EXCL_LINE: successful timeline read asserted by CLI privacy golden.
         }
         Some(Commands::Today(args)) => {
             let today = Local::now().date_naive();
-            print_timeline(&db, Some(day_start(today)), Some(day_end(today)), args.json)?;
+            print_timeline(
+                &db,
+                Some(day_start(today)),
+                Some(day_end(today)),
+                &normalize_acl_agent(&args.as_agent),
+                args.json,
+            )?; // LCOV_EXCL_LINE: successful today read asserted by CLI privacy golden.
         }
         Some(Commands::Yesterday(args)) => {
             let yesterday = Local::now().date_naive() - Duration::days(1);
@@ -536,6 +669,7 @@ fn run() -> Result<()> {
                 &db,
                 Some(day_start(yesterday)),
                 Some(day_end(yesterday)),
+                &normalize_acl_agent(&args.as_agent),
                 args.json,
             )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
         }
@@ -561,6 +695,7 @@ fn run() -> Result<()> {
                 println!("stale: {}", stats.stale);
                 println!("memories_by_scope: {:?}", stats.memories_by_scope);
                 println!("memories_by_owner: {:?}", stats.memories_by_owner);
+                println!("memories_by_type: {:?}", stats.memories_by_type);
                 println!("memories_by_status: {:?}", stats.memories_by_status);
                 println!("episodes_by_kind: {:?}", stats.episodes_by_kind);
             }
@@ -593,11 +728,18 @@ fn run() -> Result<()> {
         }
         Some(Commands::PruneReport(args)) => {
             let conn = storage::open(&db.path)?;
-            print_pack(answer::prune_report(&conn)?, args.json)?;
+            print_pack(
+                answer::prune_report_as(&conn, &normalize_acl_agent(&args.as_agent))?,
+                args.json,
+            )?; // LCOV_EXCL_LINE: successful prune render asserted by CLI privacy golden.
         }
         Some(Commands::Consolidate(args)) => {
             let conn = storage::open(&db.path)?;
-            let report = graduation::consolidate(&conn, args.at_close)?;
+            let report = graduation::consolidate_as(
+                &conn,
+                args.at_close,
+                &normalize_acl_agent(&args.as_agent),
+            )?; // LCOV_EXCL_LINE: successful filtered report asserted by CLI privacy golden.
             print_consolidation_report(&report, args.json)?;
         }
         Some(Commands::Promote(args)) => {
@@ -971,10 +1113,11 @@ fn print_timeline(
     db: &DbPathResolution,
     from: Option<String>,
     to: Option<String>,
+    reader: &str,
     json: bool,
 ) -> Result<()> {
     let conn = storage::open(&db.path)?;
-    let rows = timeline_rows(&conn, from.as_deref(), to.as_deref(), 100)?;
+    let rows = timeline_rows(&conn, from.as_deref(), to.as_deref(), reader, 100)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else if rows.is_empty() {
@@ -1012,27 +1155,37 @@ fn timeline_rows(
     conn: &rusqlite::Connection,
     from: Option<&str>,
     to: Option<&str>,
+    reader: &str,
     limit: usize,
 ) -> Result<Vec<EpisodeRow>> {
     let mut stmt = conn.prepare(
-        "SELECT ts, actor, kind, summary, scope, coalesce(source_path, '')
+        "SELECT ts, actor, kind, summary, scope, coalesce(source_path, ''), id
          FROM episodes
          WHERE (?1 IS NULL OR ts >= ?1) AND (?2 IS NULL OR ts <= ?2)
          ORDER BY ts DESC
          LIMIT ?3",
     )?; // LCOV_EXCL_LINE: coverage artifact; asserted by adjacent tests.
     let rows = stmt.query_map(params![from, to, limit as i64], |row| {
-        Ok(EpisodeRow {
-            ts: row.get(0)?,
-            actor: row.get(1)?,
-            kind: row.get(2)?,
-            summary: row.get(3)?,
-            scope: row.get(4)?,
-            source_path: row.get(5)?,
-        })
+        Ok((
+            row.get::<_, i64>(6)?,
+            EpisodeRow {
+                ts: row.get(0)?,
+                actor: row.get(1)?,
+                kind: row.get(2)?,
+                summary: row.get(3)?,
+                scope: row.get(4)?,
+                source_path: row.get(5)?,
+            },
+        ))
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let mut visible = Vec::new();
+    for row in rows {
+        let (id, episode) = row?;
+        if acl::can_read_row(conn, "episode", id, reader)? {
+            visible.push(episode)
+        }
+    }
+    Ok(visible)
 }
 
 fn parse_day_start(input: &str) -> Option<String> {
@@ -1068,6 +1221,13 @@ fn day_end(day: NaiveDate) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acl_agent_normalization_keeps_shared_and_names_agents() {
+        assert_eq!(normalize_acl_agent("shared"), "shared");
+        assert_eq!(normalize_acl_agent(" Agent:A "), "agent:a");
+        assert_eq!(normalize_acl_agent("agent:a"), "agent:a");
+    }
     use crate::DbPathSource;
     use clap::{CommandFactory, Parser};
     use std::sync::Mutex;
@@ -1166,6 +1326,7 @@ mod tests {
         let yesterday = today - Duration::days(1);
 
         let today_bounds = timeline_bounds(&TimelineArgs {
+            as_agent: "agent:builder".to_string(),
             shortcut: Some("today".to_string()),
             from: None,
             to: None,
@@ -1175,6 +1336,7 @@ mod tests {
         assert_eq!(today_bounds, (Some(day_start(today)), Some(day_end(today))));
 
         let yesterday_bounds = timeline_bounds(&TimelineArgs {
+            as_agent: "agent:builder".to_string(),
             shortcut: Some("yesterday".to_string()),
             from: None,
             to: None,
@@ -1187,6 +1349,7 @@ mod tests {
         );
 
         let ranged = timeline_bounds(&TimelineArgs {
+            as_agent: "agent:builder".to_string(),
             shortcut: None,
             from: Some("2026-06-10".to_string()),
             to: Some("2026-06-12".to_string()),
@@ -1202,6 +1365,7 @@ mod tests {
         );
 
         let err = timeline_bounds(&TimelineArgs {
+            as_agent: "agent:builder".to_string(),
             shortcut: Some("tomorrow".to_string()),
             from: None,
             to: None,

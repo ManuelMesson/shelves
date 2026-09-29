@@ -15,7 +15,7 @@ pub mod search;
 pub mod storage;
 
 pub const CONTRACT_VERSION: &str = "1.0";
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "3";
 
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
