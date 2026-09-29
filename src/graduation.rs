@@ -496,10 +496,19 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn restore_test_root(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AIOS_ROOT", value) },
+            None => unsafe { std::env::remove_var("AIOS_ROOT") },
+        }
+    }
+
     #[test]
     fn consolidate_default_reader_writes_a_filtered_report() {
         let _guard = crate::test_env_lock().lock().unwrap();
-        let previous = std::env::var_os("AIOS_ROOT");
+        let original = std::env::var_os("AIOS_ROOT");
+        let previous = std::ffi::OsString::from("known-previous-root");
+        unsafe { std::env::set_var("AIOS_ROOT", &previous) };
         let root = TempDir::new().unwrap();
         unsafe { std::env::set_var("AIOS_ROOT", root.path()) };
         let conn = Connection::open_in_memory().unwrap();
@@ -513,10 +522,27 @@ mod tests {
         let report = consolidate(&conn, false).unwrap();
         assert!(report.candidates.is_empty());
         assert!(Path::new(report.report_path.as_deref().unwrap()).exists());
-        match previous {
-            Some(value) => unsafe { std::env::set_var("AIOS_ROOT", value) }, // LCOV_EXCL_LINE: cleanup depends on caller's ambient environment; absent branch is asserted.
-            None => unsafe { std::env::remove_var("AIOS_ROOT") },
-        }
+        restore_test_root(Some(previous.clone()));
+        assert_eq!(std::env::var_os("AIOS_ROOT"), Some(previous));
+        restore_test_root(None);
+        assert_eq!(std::env::var_os("AIOS_ROOT"), None);
+        restore_test_root(original);
+    }
+
+    #[test]
+    fn consolidate_default_reader_restores_unset_root() {
+        let _guard = crate::test_env_lock().lock().unwrap();
+        let original = std::env::var_os("AIOS_ROOT");
+        unsafe { std::env::remove_var("AIOS_ROOT") };
+        let root = TempDir::new().unwrap();
+        unsafe { std::env::set_var("AIOS_ROOT", root.path()) };
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+        let report = consolidate(&conn, false).unwrap();
+        assert!(Path::new(report.report_path.as_deref().unwrap()).exists());
+        restore_test_root(None);
+        assert_eq!(std::env::var_os("AIOS_ROOT"), None);
+        restore_test_root(original);
     }
 
     #[test]

@@ -348,7 +348,7 @@ pub fn context_with_locales(
             &lock_relevance_scores,
             owned_lines,
             max_lines,
-        )? // LCOV_EXCL_LINE: successful empty-task branch asserted by context goldens.
+        )? // LCOV_EXCL_LINE: context_empty_task_does_not_apply_relevance_floor asserts this branch's returned lines; LLVM assigns this terminator zero hits.
     };
     let withheld = search::withheld_private_count(conn, &prepared.search_text, &reader)?;
     if withheld > 0 {
