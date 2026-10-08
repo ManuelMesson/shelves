@@ -1,0 +1,33 @@
+name: Ticket link advisory
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  ticket-link:
+    name: Ticket link (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    continue-on-error: true
+    steps:
+      # Metadata only: never check out or execute code from the PR.
+      - name: Check Ticket line
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          body = event.get("pull_request", {}).get("body") or ""
+          if not re.search(r"(?m)^Ticket:[ \t]*\S[^\r\n]*$", body):
+              print("::warning::PR body needs Ticket: <ticket filename or none — why>. Advisory only; this check does not block merging.")
+          else:
+              print("Ticket line present.")
+          PYTHON
